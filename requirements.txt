@@ -1,0 +1,35 @@
+# Runtime dependencies for feature extraction, training and evaluation (GPU).
+# The tested versions are pinned in requirements-lock.txt.
+torch>=2.6.0
+torchvision>=0.21.0
+lightning>=2.6.0
+lightning-bolts>=0.7.0       # LinearWarmupCosineAnnealingLR
+lightning-utilities
+torchmetrics
+setuptools<81                # lightning-bolts 0.7 imports pkg_resources (tested with 75.8.2)
+hydra-core>=1.3.2
+hydra-colorlog
+omegaconf
+rootutils
+rich
+wandb
+numpy
+scipy
+einops>=0.8.0
+safetensors
+pillow
+opencv-python
+matplotlib
+tqdm
+roma
+packaging
+transformers>=4.53.0         # V-JEPA2 needs AutoVideoProcessor (tested with 5.4.0)
+diffusers>=0.37.1            # Wan, CogVideoX and Aether extractors
+huggingface-hub>=0.22
+imageio                      # Aether extractor
+plyfile                      # Aether post-processing utilities
+
+# Optional, imported lazily:
+#   trimesh, pytorch3d  point-cloud metrics and visualisation only
+#   filterpy            Aether camera smoothing
+#   pillow-heif         HEIC images in the vendored Fast3R utilities

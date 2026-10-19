@@ -1,0 +1,3202 @@
+"""
+InsScene-15K dataset loader for probe training (identity, depth, point, camera).
+
+Supports two data sources that have identity masks + depth + camera:
+  - processed_infinigen: ObjectSegmentation/*.npy, Depth/*.npy, camview/*.npz
+  - processed_scannetpp_v2: refined_ins_ids/*.npy, depth/*.png, metadata.npz
+
+Point maps are computed from depth + intrinsics + extrinsics via back-projection.
+"""
+
+import hashlib
+import json
+import logging
+import math
+import os
+import tempfile
+from collections import OrderedDict
+from glob import glob
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from safetensors.torch import load_file
+from vidfm3d.utils import aoss_fs
+
+from vidfm3d.data.components.video_probe_dataset import invert_pose_ref_and_scale
+from vidfm3d.dust3r.datasets.base.easy_dataset import EasyDataset
+from vidfm3d.utils.feature_layers import (
+    default_feature_channels,
+    default_feature_hw,
+    feature_filename,
+)
+from vidfm3d.utils.aether_temporal import aether_streaming_token_indices
+from vidfm3d.utils.owner_catalog import (
+    OwnerCatalogError,
+    load_owner_catalog,
+    resolve_owner,
+    streaming_key,
+)
+from vidfm3d.utils.temporal_sampling import (
+    sort_frame_names,
+    temporal_windows_from_poses,
+)
+
+logger = logging.getLogger(__name__)
+
+# PROBE_FP16_PASSTHROUGH=1 keeps precomputed VFM features in their storage
+# dtype (fp16, or bf16 for MiniMax-H3) through the DataLoader workers and, in
+# training, into the probe: nothing widens them to fp32 later (the evaluators
+# cast batch tensors to fp32 on the device). Values this
+# loader derives from them, such as the B2 query token (a masked mean), are
+# computed in that dtype too. The default 0 casts them to fp32 in the workers.
+# Under bf16-mixed the two settings give different values and changed training
+# outcomes, so the setting is part of the recipe: use the value that
+# scripts/probe_recipe.py prints (see PROBE_FP16_PASSTHROUGH in docs/PROTOCOL.md).
+_FP16_PASSTHROUGH = os.environ.get("PROBE_FP16_PASSTHROUGH", "0") == "1"
+
+
+def _feat_cast(feat: torch.Tensor) -> torch.Tensor:
+    return feat if _FP16_PASSTHROUGH else feat.float()
+
+
+def canonical_streaming_sample_id(
+    scene_info: dict,
+    task: str,
+    target_indices=None,
+    object_id: int | None = None,
+) -> str:
+    """Return a stable, model-independent ID for one streaming sample."""
+    targets = [int(v) for v in (target_indices or [])]
+    parts = [
+        str(task),
+        str(scene_info.get("source", "unknown")),
+        str(scene_info.get("scene_id") or os.path.basename(str(scene_info["scene_dir"]).rstrip("/"))),
+        f"window={int(scene_info.get('streaming_window_id', -1))}",
+        f"tail={int(scene_info.get('streaming_tail_raw', scene_info.get('streaming_tail', -1)))}",
+        "targets=" + ",".join(str(v) for v in targets),
+    ]
+    if object_id is not None:
+        parts.append(f"object={int(object_id)}")
+    return "|".join(parts)
+
+
+@torch.no_grad()
+def depth_to_pointmap(depth, intrinsic, extrinsic):
+    """Back-project depth map to 3D world-coordinate point map.
+
+    Args:
+        depth: (H, W) depth in meters, float32.
+        intrinsic: (3, 3) camera intrinsic matrix.
+        extrinsic: (3, 4) camera extrinsic [R|t] (world-to-cam).
+
+    Returns:
+        pointmap: (H, W, 3) world-coordinate 3D points.
+    """
+    H, W = depth.shape
+    # Build pixel grid
+    v, u = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32),
+        torch.arange(W, dtype=torch.float32),
+        indexing="ij",
+    )
+    ones = torch.ones_like(u)
+    uv1 = torch.stack([u, v, ones], dim=-1)  # (H, W, 3)
+
+    # Unproject to camera coordinates: P_cam = K^-1 * [u,v,1]^T * depth
+    K_inv = torch.inverse(intrinsic.float())  # (3, 3)
+    pts_cam = (uv1 @ K_inv.T) * depth.unsqueeze(-1)  # (H, W, 3)
+
+    # Camera-to-world: P_world = R^T * (P_cam - t)
+    R = extrinsic[:3, :3].float()  # (3, 3)
+    t = extrinsic[:3, 3].float()   # (3,)
+    pts_world = (pts_cam - t) @ R  # (H, W, 3)  equiv to R^T @ (p - t)
+
+    return pts_world
+
+
+def camera_to_world_to_extrinsic(T: torch.Tensor) -> torch.Tensor:
+    """Convert a 4x4 camera-to-world pose into a 3x4 world-to-camera extrinsic."""
+    T = T.float()
+    R_c2w = T[:3, :3]
+    c = T[:3, 3]
+    R_w2c = R_c2w.T
+    t_w2c = -R_w2c @ c
+    return torch.cat([R_w2c, t_w2c[:, None]], dim=1)
+
+
+class InsScene15KDataset(EasyDataset):
+    """Dataset for training identity mask probe on InsScene-15K data."""
+
+    # Defaults for objects built without __init__ (unit tests, tools); __init__
+    # sets both from PROBE_OWNER_OVERLAY_MANIFEST and INSCENE_LABEL_CACHE_ROOT.
+    owner_overlay_enabled = False
+    _label_cache_root = None
+
+    def __init__(
+        self,
+        root: str,
+        root_vfm: str = None,
+        sources: list = None,
+        split: str = "train",
+        vfm_name: str = "wan",
+        feat_postfix: str = "_t749_layer20",
+        feature_layer: int = None,
+        feature_timestep: int = None,
+        feature_prefix: str = "feature",
+        feat_pixalign: bool = True,
+        seed: int = None,
+        num_views: int = 4,
+        min_view_interval: int = 5,
+        context_len: int = 76,
+        query_idx_divisor: int = 4,
+        target_h: int = 288,
+        target_w: int = 512,
+        train_ratio: float = 0.9,
+        split_manifest: str = None,
+        scene_manifest: str = None,
+        max_identity_classes: int = 256,
+        window_size: int = 0,
+        include_pmaps: bool = True,
+        streaming_prefix: bool = False,
+        prefix_stride: int = 1,
+        prefix_min_len: int = 1,
+        prefix_max_len: int = None,
+        prefix_lengths: list = None,
+        streaming_feat_root: str = None,
+        streaming_prefix_dir_fmt: str = "prefix_{tail:06d}",
+        temporal_sampling: str = "motion_uniform",
+        streaming_motion_step: float = 0.35,
+        streaming_rotation_weight: float = 0.5,
+        streaming_window_stride: int = 8,
+        streaming_max_windows_per_scene: int = 4,
+        streaming_window_obs_len: int = None,
+        context_feat_root: str = None,
+        context_segment_dir_fmt: str = "context_{start:06d}_{tail:06d}",
+        # ---------- Spatial Diagnostic Suite toggles ----------
+        diag_overlap: bool = False,        # A2: compute (S,S) overlap matrix
+        diag_hidden_obj: bool = False,     # B1: pick hidden object + polar target
+        diag_visible_obj: bool = False,    # B2 sanity: pick current-view visible object
+        hidden_obj_min_visible_pixels: int = 200,
+        streaming_shared_hidden_obj: bool = False,
+        streaming_hidden_seed_prefix_len: int = 8,
+        streaming_hidden_prefix_lengths: list = None,
+        streaming_hidden_min_history_visible_frames: int = 3,
+        streaming_hidden_min_query_pixels: int = 1024,
+        streaming_hidden_min_border_px: int = 16,
+        streaming_hidden_strict_post_history: bool = False,
+        strict_zero_hidden_b2: bool = False,
+        diag_action: bool = False,         # C1: load target_feat + emit action
+        diag_abnormal: bool = False,       # A3: load shuffled vfm features
+        diag_path_integration: bool = False,  # C2: recurrent multi-action feature prediction
+        diag_counterfactual: bool = False,    # C3: multi-horizon action intervention prediction
+        target_feat_root: str = None,      # root for C1/C2/C3 isolated target features
+        target_index_root: str = None,     # optional local/AOSS root for target_indices.npy
+        target_layout: str = "auto",       # auto|flat|per_prefix
+        shuffled_feat_root: str = None,    # root for A3 shuffled features
+        action_horizons: list = None,      # frame offsets from action-reference frame, e.g. [1, 10, 30]
+        counterfactual_min_overlap: float = 0.05,
+        streaming_target_from_prefix: bool = False,
+        scramble_feat: bool = False,       # Control: replace VFM feat with randn (same shape)
+        allow_missing_vfm: bool = False,   # Debug only: use dummy zeros if a normal VFM feature is missing
+        owner_catalog: str = None,         # optional READY fail-closed owner catalog (unpublished; leave unset; docs/PROTOCOL.md section 8)
+        no_obj_mask: bool = False,         # Ablation: replace obj mask with all-ones (global pool)
+        pose_only: bool = False,           # Deprecated alias for unconditional_baseline
+        unconditional_baseline: bool = False,  # zero visual/object conditions
+        **kwargs,
+    ):
+        """
+        Args:
+            root: Path to InsScene-15K data root (containing processed_scannetpp_v2/).
+            root_vfm: Path to pre-extracted VFM features (optional, for full pipeline).
+            sources: List of data sources to use. Default: ["processed_scannetpp_v2"].
+            split: "train" or "val".
+            vfm_name: VFM backbone name.
+            target_h, target_w: Target resolution to resize images and masks to.
+            train_ratio: Fraction of scenes for training split.
+            max_identity_classes: Cap on number of identity classes per scene.
+            window_size: If > 0, split long videos into overlapping windows of this size.
+                         Stride = window_size // 2.  0 or negative disables windowing.
+        """
+        if split not in {"train", "val", "test", "all"}:
+            raise ValueError(f"Unknown dataset split {split!r}; expected train, val, test, or all")
+        # Site-specific storage is supplied by the scheduler/environment. This
+        # keeps historical YAMLs runnable without baking one cluster's mount
+        # points into the scientific configuration.
+        root = os.environ.get("INSCENE_DATA_ROOT", root)
+        root_vfm = os.environ.get("INSCENE_FEAT_ROOT", root_vfm)
+        target_feat_root = os.environ.get("INSCENE_TARGET_FEAT_ROOT", target_feat_root)
+        target_index_root = os.environ.get("INSCENE_TARGET_INDEX_ROOT", target_index_root)
+        target_layout = os.environ.get("INSCENE_TARGET_LAYOUT", target_layout)
+        shuffled_feat_root = os.environ.get("INSCENE_SHUFFLED_FEAT_ROOT", shuffled_feat_root)
+        context_feat_root = os.environ.get("INSCENE_CONTEXT_FEAT_ROOT", context_feat_root)
+        streaming_feat_root = os.environ.get("INSCENE_STREAMING_FEAT_ROOT", streaming_feat_root)
+        owner_catalog = os.environ.get("INSCENE_OWNER_CATALOG", owner_catalog)
+        if sources is None:
+            sources = ["processed_scannetpp_v2"]
+
+        self.root = root
+        self.root_vfm = root_vfm
+        self.sources = sources
+        self.split = split
+        self.vfm_name = vfm_name
+        self.feat_postfix = feat_postfix
+        self.feature_layer = feature_layer
+        self.feature_timestep = feature_timestep
+        self.feature_prefix = feature_prefix
+        self.owner_overlay_enabled = bool(os.environ.get("PROBE_OWNER_OVERLAY_MANIFEST"))
+        if self.owner_overlay_enabled:
+            # Verify manifest and both immutable DB hashes before any samples
+            # are exposed to a worker.
+            from vidfm3d.utils import probe_owner_overlay
+            probe_owner_overlay.load_manifest()
+        self.feat_pixalign = feat_pixalign
+        # Validation/test samples must not change between epochs. Training keeps
+        # worker-seeded stochastic frame sampling unless a seed is explicit.
+        self.seed = seed if seed is not None else (0 if split in {"val", "test"} else None)
+        self.num_views = num_views
+        self.min_view_interval = min_view_interval
+        self.context_len = context_len
+        self.query_idx_divisor = query_idx_divisor
+        self.target_h = target_h
+        self.target_w = target_w
+        self.max_identity_classes = max_identity_classes
+        self.split_manifest = split_manifest or os.environ.get("INSCENE_SPLIT_MANIFEST")
+        self.scene_manifest = scene_manifest or os.environ.get("INSCENE_MANIFEST")
+        exclusions_path = os.environ.get("INSCENE_STREAMING_EXCLUSIONS")
+        self.streaming_excluded_units = set()
+        if exclusions_path:
+            with open(exclusions_path, encoding="utf-8") as handle:
+                self.streaming_excluded_units = {
+                    line.strip()
+                    for line in handle
+                    if line.strip() and not line.lstrip().startswith("#")
+                }
+        self.window_size = window_size
+        self.include_pmaps = include_pmaps
+        self.streaming_prefix = streaming_prefix
+        self.prefix_stride = max(int(prefix_stride), 1)
+        self.prefix_min_len = max(int(prefix_min_len), 1)
+        self.prefix_max_len = int(prefix_max_len) if prefix_max_len is not None else None
+        if isinstance(prefix_lengths, str):
+            prefix_lengths = prefix_lengths.replace(",", " ").split()
+        self.prefix_lengths = (
+            sorted({int(v) for v in prefix_lengths if int(v) > 0})
+            if prefix_lengths is not None else None
+        )
+        self.streaming_feat_root = streaming_feat_root
+        self.streaming_prefix_dir_fmt = streaming_prefix_dir_fmt
+        self.temporal_sampling = temporal_sampling
+        self.streaming_motion_step = float(streaming_motion_step)
+        self.streaming_rotation_weight = float(streaming_rotation_weight)
+        self.streaming_window_stride = int(streaming_window_stride)
+        self.streaming_max_windows_per_scene = int(streaming_max_windows_per_scene)
+        self.streaming_window_obs_len = int(streaming_window_obs_len) if streaming_window_obs_len is not None else None
+        self.context_feat_root = context_feat_root
+        self.context_segment_dir_fmt = context_segment_dir_fmt
+        self._streaming_prefix_meta_cache = {}
+        self._context_segment_meta_cache = {}
+        self._target_index_cache = {}
+        self._streaming_hidden_obj_cache = {}
+        self._scene_metadata_cache = OrderedDict()
+        self._scene_metadata_cache_max = max(
+            int(os.environ.get("INSCENE_METADATA_CACHE_MAX_SCENES", "32")), 1
+        )
+        self._label_cache_root = os.environ.get("INSCENE_LABEL_CACHE_ROOT")
+        self._label_cache_manifest_sha256 = os.environ.get("INSCENE_MANIFEST_SHA256")
+        self._label_cache_version = "tstep-label-v1"
+        self._probe_task = os.environ.get("INSCENE_PROBE_TASK", "")
+        # Diagnostic suite flags
+        self.diag_overlap = diag_overlap
+        self.diag_hidden_obj = diag_hidden_obj
+        self.diag_visible_obj = diag_visible_obj
+        self.hidden_obj_min_visible_pixels = int(hidden_obj_min_visible_pixels)
+        self.streaming_shared_hidden_obj = bool(streaming_shared_hidden_obj)
+        self.streaming_hidden_seed_prefix_len = int(streaming_hidden_seed_prefix_len)
+        if isinstance(streaming_hidden_prefix_lengths, str):
+            streaming_hidden_prefix_lengths = streaming_hidden_prefix_lengths.replace(",", " ").split()
+        self.streaming_hidden_prefix_lengths = (
+            sorted({int(v) for v in streaming_hidden_prefix_lengths if int(v) > 0})
+            if streaming_hidden_prefix_lengths is not None else None
+        )
+        self.streaming_hidden_min_history_visible_frames = int(streaming_hidden_min_history_visible_frames)
+        self.streaming_hidden_min_query_pixels = int(streaming_hidden_min_query_pixels)
+        self.streaming_hidden_min_border_px = int(streaming_hidden_min_border_px)
+        self.streaming_hidden_strict_post_history = bool(streaming_hidden_strict_post_history)
+        self.strict_zero_hidden_b2 = bool(strict_zero_hidden_b2)
+        self.diag_action = diag_action
+        self.diag_abnormal = diag_abnormal
+        self.diag_path_integration = diag_path_integration
+        self.diag_counterfactual = diag_counterfactual
+        self.target_feat_root = target_feat_root
+        self.target_index_root = target_index_root
+        if target_layout not in {"auto", "flat", "per_prefix"}:
+            raise ValueError(f"target_layout must be auto|flat|per_prefix, got {target_layout!r}")
+        self.target_layout = target_layout
+        self.shuffled_feat_root = shuffled_feat_root
+        self.action_horizons = sorted({int(h) for h in (action_horizons or []) if int(h) > 0})
+        self.counterfactual_min_overlap = counterfactual_min_overlap
+        self.streaming_target_from_prefix = bool(streaming_target_from_prefix)
+        self.scramble_feat = scramble_feat
+        self.allow_missing_vfm = allow_missing_vfm
+        self.owner_catalog = None
+        if owner_catalog:
+            if allow_missing_vfm:
+                raise OwnerCatalogError(
+                    "owner catalog forbids allow_missing_vfm dummy features"
+                )
+            if self.owner_overlay_enabled:
+                raise OwnerCatalogError(
+                    "INSCENE_OWNER_CATALOG and PROBE_OWNER_OVERLAY_MANIFEST are mutually "
+                    "exclusive owner sources; bind exactly one"
+                )
+            self.owner_catalog = load_owner_catalog(owner_catalog)
+        self.no_obj_mask = no_obj_mask
+        self.pose_only = pose_only or unconditional_baseline
+        # A2/B1/C1 all need extrinsics normalized via pointmap-based scale
+        # (invert_pose_ref_and_scale requires pointmaps).
+        if (
+            diag_overlap
+            or diag_hidden_obj
+            or diag_visible_obj
+            or diag_action
+            or diag_path_integration
+            or diag_counterfactual
+        ) and not include_pmaps:
+            self.include_pmaps = True
+        self.kwargs = kwargs
+
+        # Collect all scenes. When INSCENE_MANIFEST is supplied, trust the local
+        # manifest and avoid remote directory exploration during training startup.
+        self.scenes = []
+        loaded_from_scene_manifest = bool(self.scene_manifest)
+        manifest_records_are_expanded = False
+        if loaded_from_scene_manifest:
+            self.scenes = self._load_scene_manifest(self.scene_manifest, split)
+            manifest_records_are_expanded = any(
+                "streaming_tail" in scene for scene in self.scenes
+            )
+            if manifest_records_are_expanded and self.streaming_excluded_units:
+                self.scenes = [
+                    scene
+                    for scene in self.scenes
+                    if self._streaming_unit_key(scene)
+                    not in self.streaming_excluded_units
+                ]
+        else:
+            for source in sources:
+                source_path = aoss_fs.join(root, source)
+                if not aoss_fs.isdir(source_path):
+                    logger.warning(f"Source path {source_path} not found, skipping.")
+                    continue
+
+                if source == "processed_infinigen":
+                    self._collect_infinigen_scenes(source_path)
+                elif source == "processed_scannetpp_v2":
+                    self._collect_scannetpp_scenes(source_path)
+
+        # Split at scene level before window expansion. A frozen manifest is
+        # required for a genuine test set and strongly recommended otherwise.
+        if loaded_from_scene_manifest:
+            if not self.scenes:
+                raise ValueError(
+                    f"Scene manifest {self.scene_manifest} yielded no records for split={split!r}"
+                )
+        elif self.split_manifest:
+            manifest = aoss_fs.load_json(self.split_manifest)
+            splits = manifest.get("splits", manifest)
+            if split not in splits:
+                raise ValueError(f"Split {split!r} missing from {self.split_manifest}")
+            allowed = set(splits[split])
+            self.scenes = [s for s in self.scenes if self._scene_key(s) in allowed]
+            missing = allowed - {self._scene_key(s) for s in self.scenes}
+            if missing:
+                raise ValueError(
+                    f"Split manifest references {len(missing)} unavailable scenes; "
+                    f"first={sorted(missing)[0]}"
+                )
+        elif split == "all":
+            pass
+        elif split == "test":
+            raise ValueError("A distinct test split requires split_manifest=...")
+        else:
+            logger.warning("No split manifest supplied; using legacy deterministic train/val split")
+            rng = np.random.default_rng(seed=42)
+            indices = rng.permutation(len(self.scenes))
+            split_idx = int(len(self.scenes) * train_ratio)
+            selected = indices[:split_idx] if split == "train" else indices[split_idx:]
+            self.scenes = [self.scenes[i] for i in selected]
+
+        # Expand scenes with windowing for long videos. Streaming prefix uses
+        # shared ScanNet++ temporal windows by default; each probe sees prefixes
+        # cut from the same motion-normalized observation sequence. Sample-level
+        # manifests are already expanded and skip this remote-free computation.
+        if getattr(self, "streaming_prefix", False) and not manifest_records_are_expanded:
+            self._expand_scenes_with_streaming_prefix()
+        elif self.window_size > 0 and not manifest_records_are_expanded:
+            self._expand_scenes_with_windows()
+
+        # Pre-expanded C manifests may request windows/prefixes that this VFM
+        # never extracted. Keep only (window, tail) pairs present on disk.
+        trust_expanded_manifest = (
+            os.environ.get("INSCENE_TRUST_EXPANDED_MANIFEST", "0") == "1"
+        )
+        if (
+            getattr(self, "streaming_prefix", False)
+            and (self.streaming_feat_root or self.root_vfm)
+            and not self.owner_overlay_enabled
+            and not (
+                loaded_from_scene_manifest
+                and manifest_records_are_expanded
+                and trust_expanded_manifest
+            )
+        ):
+            self._filter_streaming_samples_to_prefix_index()
+
+        # Assign C1 horizons only after prefix/owner filtering, preserving the
+        # original training budget and covering every horizon in evaluation.
+        self._expand_c1_horizon_samples()
+
+        logger.info(
+            f"InsScene15KDataset: {len(self.scenes)} samples for {split} split "
+            f"from sources {sources} (window_size={self.window_size}, "
+            f"streaming_prefix={self.streaming_prefix})"
+        )
+
+    def _expand_c1_horizon_samples(self):
+        """Balance training horizons without increasing the prefix count.
+
+        Training assigns one horizon per prefix by a seeded random partition;
+        counts differ by at most one. The assignment is fixed across epochs and
+        independent of worker access order. Evaluation expands every prefix to
+        all horizons. The parent manifest ID stays unchanged; emitted C1 sample
+        IDs include the selected target. Single-horizon behavior is unchanged.
+        """
+        if not (self.streaming_prefix and self.diag_action):
+            return
+        horizons = self.action_horizons or [1]
+        if len(horizons) == 1:
+            return
+        if any((self.diag_overlap, self.diag_hidden_obj, self.diag_visible_obj,
+                self.diag_abnormal, self.diag_path_integration, self.diag_counterfactual)):
+            raise ValueError("Mixed-horizon C1 requires a dedicated diag_action dataset")
+        if self.streaming_target_from_prefix:
+            raise ValueError("Mixed-horizon C1 requires target-isolated features")
+        assigned = []
+        if self.split == "train":
+            # Construct in the parent process, before persistent workers start.
+            # Explicit dataset seed wins; otherwise use the experiment's torch
+            # seed, not a worker's sampling RNG or Python's randomized hash.
+            seed = self.seed if self.seed is not None else torch.initial_seed()
+            order = np.random.default_rng(seed).permutation(len(self.scenes))
+            horizon_by_index = np.empty(len(self.scenes), dtype=np.int64)
+            horizon_by_index[order] = np.asarray(horizons)[np.arange(len(order)) % len(horizons)]
+        for index, scene in enumerate(self.scenes):
+            window = scene.get("streaming_window_indices")
+            tail = int(scene["streaming_tail"])
+            if window is None or tail + max(horizons) >= len(window):
+                raise ValueError(
+                    "Mixed-horizon C1 requires explicit canonical window indices "
+                    f"covering all horizons {horizons}: {scene.get('sample_id', scene['scene_dir'])}"
+                )
+            selected = [int(horizon_by_index[index])] if self.split == "train" else horizons
+            for horizon in selected:
+                assigned.append({**scene, "c1_target_horizon": int(horizon)})
+        self.scenes = assigned
+
+    def _load_scene_manifest(self, manifest_path: str, split: str):
+        """Load precomputed scene/sample records without scanning storage.
+
+        JSONL is preferred for large manifests. JSON files may contain either a
+        list of records or {"samples": [...]} / {"scenes": [...]}. Records can
+        be scene-level or already-expanded streaming samples. Sample-level
+        records include ``streaming_tail`` and are consumed directly.
+        """
+        if aoss_fs.is_remote(manifest_path):
+            payload = aoss_fs.read_bytes(manifest_path).decode("utf-8")
+        else:
+            with open(manifest_path, "r") as f:
+                payload = f.read()
+
+        records = []
+        if manifest_path.endswith(".jsonl"):
+            for line in payload.splitlines():
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        else:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                records = data.get("samples") or data.get("scenes") or data.get("records") or []
+            elif isinstance(data, list):
+                records = data
+            else:
+                raise ValueError(f"Unsupported manifest payload in {manifest_path}")
+
+        scenes = []
+        for record in records:
+            if split != "all" and "split" in record and record["split"] != split:
+                continue
+            scenes.append(self._normalize_scene_manifest_record(record))
+
+        logger.info(
+            f"Loaded {len(scenes)} records from scene manifest {manifest_path} "
+            f"for split={split}"
+        )
+        return scenes
+
+    def _normalize_scene_manifest_record(self, record: dict):
+        scene = dict(record)
+        if "scene_dir" not in scene and "data_prefix" in scene:
+            scene["scene_dir"] = scene["data_prefix"]
+        if "scene_dir" not in scene:
+            raise ValueError("Manifest record must contain scene_dir or data_prefix")
+        scene.setdefault("source", "scannetpp")
+        scene.setdefault("scene_id", os.path.basename(str(scene["scene_dir"]).rstrip("/")))
+
+        # Frozen manifests record raw-data paths from the machine that wrote
+        # them. INSCENE_LOCAL_SCENE_ROOT remaps ScanNet++ scene directories to a
+        # local copy without rewriting the manifest. Feature roots are not
+        # remapped.
+        local_scene_root = os.environ.get("INSCENE_LOCAL_SCENE_ROOT")
+        if local_scene_root and scene["source"] == "scannetpp":
+            scene["scene_dir"] = aoss_fs.join(local_scene_root, scene["scene_id"])
+
+        int_fields = [
+            "num_frames",
+            "streaming_tail",
+            "streaming_tail_raw",
+            "streaming_window_id",
+            "streaming_obs_start",
+            "strict_object_id",
+        ]
+        for key in int_fields:
+            if key in scene and scene[key] is not None:
+                scene[key] = int(scene[key])
+
+        int_list_fields = [
+            "valid_pose_indices",
+            "streaming_indices",
+            "streaming_window_indices",
+        ]
+        for key in int_list_fields:
+            if key in scene and scene[key] is not None:
+                scene[key] = [int(v) for v in scene[key]]
+
+        if "valid_frames" in scene and scene["valid_frames"] is not None:
+            scene["valid_frames"] = [str(v) for v in scene["valid_frames"]]
+        if "poses_c2w" in scene and scene["poses_c2w"] is not None:
+            scene["poses_c2w"] = np.asarray(scene["poses_c2w"], dtype=np.float32)
+        return scene
+
+    def _streaming_unit_key(self, scene_info: dict) -> str:
+        scene = str(
+            scene_info.get("scene_id")
+            or os.path.basename(str(scene_info["scene_dir"]).rstrip("/"))
+        )
+        return (
+            f"{scene}/window_{int(scene_info.get('streaming_window_id', 0)):04d}/"
+            f"prefix_{int(scene_info['streaming_tail']):06d}"
+        )
+
+    def _streaming_window_obs_len(self):
+        if self.streaming_window_obs_len is not None:
+            return int(self.streaming_window_obs_len)
+        candidates = []
+        if self.prefix_lengths:
+            candidates.extend(self.prefix_lengths)
+        if self.prefix_max_len is not None:
+            candidates.append(int(self.prefix_max_len))
+        if self._use_shared_streaming_hidden_obj():
+            candidates.extend(self._streaming_hidden_prefix_lengths())
+        future_horizons = self._streaming_future_horizons(default=[])
+        if future_horizons:
+            max_future = max(int(h) for h in future_horizons)
+            bases = list(candidates) if candidates else [int(self.prefix_min_len)]
+            candidates.extend(int(base) + max_future for base in bases)
+        if candidates:
+            return max(int(v) for v in candidates)
+        return int(self.prefix_min_len)
+
+    def _temporal_windows_for_scene(self, scene):
+        if (
+            self.temporal_sampling == "motion_uniform"
+            and scene.get("source") == "scannetpp"
+            and "poses_c2w" in scene
+        ):
+            return temporal_windows_from_poses(
+                scene["poses_c2w"],
+                observations_per_window=self._streaming_window_obs_len(),
+                motion_step=self.streaming_motion_step,
+                rotation_weight=self.streaming_rotation_weight,
+                window_stride=self.streaming_window_stride,
+                max_windows_per_scene=self.streaming_max_windows_per_scene,
+            )
+        nf = int(scene["num_frames"])
+        window_len = min(self._streaming_window_obs_len(), nf)
+        return [{
+            "window_id": 0,
+            "obs_start": 0,
+            "indices": list(range(window_len)),
+            "sampling": "contiguous",
+        }]
+
+    def _expand_scenes_with_streaming_prefix(self):
+        """Expand each scene into online prefix samples cut from temporal windows."""
+        expanded = []
+        max_future = max(self._streaming_future_horizons(default=[]), default=0)
+        required_hidden_len = (
+            max(self._streaming_hidden_prefix_lengths())
+            if self._use_shared_streaming_hidden_obj() else 0
+        )
+        for scene in self.scenes:
+            windows = self._temporal_windows_for_scene(scene)
+            for window in windows:
+                window_indices = [int(i) for i in window["indices"]]
+                if required_hidden_len and len(window_indices) < required_hidden_len:
+                    continue
+                max_len = len(window_indices) - max_future
+                if self.prefix_max_len is not None:
+                    max_len = min(max_len, self.prefix_max_len)
+                if max_len < self.prefix_min_len:
+                    continue
+                if self.prefix_lengths:
+                    lengths = [
+                        length for length in self.prefix_lengths
+                        if self.prefix_min_len <= length <= max_len
+                    ]
+                else:
+                    lengths = range(self.prefix_min_len, max_len + 1, self.prefix_stride)
+                for length in lengths:
+                    tail = length - 1
+                    prefix_scene = dict(scene)
+                    prefix_scene["streaming_tail"] = tail
+                    prefix_scene["streaming_tail_raw"] = int(window_indices[tail])
+                    prefix_scene["streaming_indices"] = window_indices[:length]
+                    prefix_scene["streaming_window_indices"] = window_indices
+                    prefix_scene["streaming_window_id"] = int(window.get("window_id", 0))
+                    prefix_scene["streaming_obs_start"] = int(window.get("obs_start", 0))
+                    prefix_scene["streaming_sampling"] = window.get("sampling", self.temporal_sampling)
+                    expanded.append(prefix_scene)
+        logger.info(
+            f"Streaming prefix expansion: {len(self.scenes)} scenes -> {len(expanded)} samples "
+            f"(min_len={self.prefix_min_len}, max_len={self.prefix_max_len}, "
+            f"stride={self.prefix_stride}, lengths={self.prefix_lengths}, "
+            f"temporal_sampling={self.temporal_sampling}, window_obs_len={self._streaming_window_obs_len()}, "
+            f"max_future={max_future})"
+        )
+        self.scenes = expanded
+
+    def _use_shared_streaming_hidden_obj(self):
+        return bool(
+            self.streaming_prefix
+            and self.diag_hidden_obj
+            and self.streaming_shared_hidden_obj
+        )
+
+    def _streaming_hidden_prefix_lengths(self):
+        if self.streaming_hidden_prefix_lengths:
+            return list(self.streaming_hidden_prefix_lengths)
+        if self.prefix_lengths:
+            return list(self.prefix_lengths)
+        if self.prefix_max_len is not None:
+            return [int(self.prefix_max_len)]
+        return [int(self.prefix_min_len)]
+
+    def _streaming_hidden_seed_visible_indices(self):
+        # Common-history B probes select from the full seed history.  For the
+        # default seed_prefix_len=8, candidates may be visible in frames [0..7]
+        # and are required hidden after history in the compared tails.
+        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 1)
+        return list(range(seed_len))
+
+    def _streaming_hidden_tail_indices(self):
+        seed_len = max(int(self.streaming_hidden_seed_prefix_len), 1)
+        tails = {
+            max(int(length) - 1, 0)
+            for length in self._streaming_hidden_prefix_lengths()
+            if max(int(length) - 1, 0) >= seed_len
+        }
+        return sorted(tails)
+
+    def _streaming_preferred_visible_tail_indices(self):
+        seed_tail = max(int(self.streaming_hidden_seed_prefix_len), 1) - 1
+        lengths = set(int(length) for length in self._streaming_hidden_prefix_lengths())
+        return [seed_tail] if int(self.streaming_hidden_seed_prefix_len) in lengths else []
+
+    def _streaming_future_horizons(self, default=None):
+        """Future frame offsets predicted from the current streaming tail."""
+        if not self.streaming_prefix:
+            return default if default is not None else []
+        if self.diag_path_integration or self.diag_counterfactual:
+            return list(self.action_horizons)
+        if getattr(self, "diag_action", False):
+            return list(self.action_horizons) if self.action_horizons else [1]
+        return default if default is not None else []
+
+    def _expand_scenes_with_windows(self):
+        """Expand scenes into overlapping windows for long videos.
+
+        Scenes shorter than window_size are kept as-is.
+        Longer scenes are split with stride = window_size // 2.
+        """
+        min_window = self.num_views * max(self.min_view_interval, 1)
+        stride = max(self.window_size // 2, 1)
+        expanded = []
+        for scene in self.scenes:
+            nf = scene["num_frames"]
+            if nf <= self.window_size:
+                expanded.append(scene)
+            else:
+                start = 0
+                while start < nf:
+                    end = min(start + self.window_size, nf)
+                    if end - start < min_window:
+                        break
+                    win_scene = dict(scene)  # shallow copy (valid_frames list shared)
+                    win_scene["window_start"] = start
+                    win_scene["window_end"] = end
+                    expanded.append(win_scene)
+                    start += stride
+        logger.info(
+            f"Window expansion: {len(self.scenes)} scenes -> {len(expanded)} samples "
+            f"(window_size={self.window_size}, stride={stride})"
+        )
+        self.scenes = expanded
+
+    def _try_add_infinigen_scene(self, candidate_dir):
+        """Try to register one infinigen scene/subscene directory."""
+        frames_dir = aoss_fs.join(candidate_dir, "frames")
+        img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+        mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+        cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
+
+        if not all(aoss_fs.isdir(d) for d in [img_dir, mask_dir, cam_dir]):
+            return False
+
+        img_files = sort_frame_names(
+            [f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")]
+        )
+        if len(img_files) < self.num_views:
+            return False
+
+        self.scenes.append(
+            {
+                "source": "infinigen",
+                "scene_dir": candidate_dir,
+                "num_frames": len(img_files),
+            }
+        )
+        return True
+
+    def _collect_infinigen_scenes(self, source_path):
+        """Collect scenes from processed_infinigen directory.
+
+        Supports two layouts:
+          - Flat:     source_path/scene_XXX/frames/...  (sample data)
+          - Nested:   source_path/scene_XXX/<subscene_hash>/frames/...  (full dataset)
+        """
+        for scene_dir in sorted(aoss_fs.glob(aoss_fs.join(source_path, "scene_*"))):
+            # Try flat layout first (scene_dir itself has frames/)
+            if self._try_add_infinigen_scene(scene_dir):
+                continue
+            # Try nested layout (subscene dirs inside scene_dir)
+            for sub_dir in sorted(aoss_fs.glob(aoss_fs.join(scene_dir, "*"))):
+                if aoss_fs.isdir(sub_dir):
+                    self._try_add_infinigen_scene(sub_dir)
+
+    def _collect_scannetpp_scenes(self, source_path):
+        """Collect scenes from processed_scannetpp_v2 directory.
+
+        Supports nested extraction layout where zip extracts to:
+          source_path/processed_scannetpp_v2/<scene_id>/...
+        """
+        # Handle nested directory from zip extraction
+        nested = aoss_fs.join(source_path, "processed_scannetpp_v2")
+        if aoss_fs.isdir(nested):
+            source_path = nested
+
+        for scene_id in sorted(aoss_fs.listdir(source_path)):
+            scene_dir = aoss_fs.join(source_path, scene_id)
+            if not aoss_fs.isdir(scene_dir):
+                continue
+
+            img_dir = aoss_fs.join(scene_dir, "images")
+            mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
+            meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
+
+            if not all(
+                aoss_fs.exists(p) for p in [img_dir, mask_dir, meta_path]
+            ):
+                continue
+
+            # Keep ScanNet++ in metadata/video order.  Frame names are already
+            # zero-padded, but using metadata order also gives direct pose rows.
+            img_files = set(f for f in aoss_fs.listdir(img_dir) if f.endswith(".jpg"))
+            mask_files = set(aoss_fs.listdir(mask_dir))
+            meta = self._load_scene_metadata(meta_path)
+            meta_images = [str(f) for f in meta["images"].tolist()]
+            valid_frames = []
+            valid_pose_indices = []
+            for meta_idx, frame_name in enumerate(meta_images):
+                if frame_name in img_files and f"{frame_name}.npy" in mask_files:
+                    valid_frames.append(frame_name)
+                    valid_pose_indices.append(meta_idx)
+
+            if len(valid_frames) < self.num_views:
+                continue
+            poses_c2w = meta["trajectories"][valid_pose_indices].astype(np.float32)
+
+            self.scenes.append(
+                {
+                    "source": "scannetpp",
+                    "scene_dir": scene_dir,
+                    "num_frames": len(valid_frames),
+                    "valid_frames": valid_frames,
+                    "valid_pose_indices": valid_pose_indices,
+                    "poses_c2w": poses_c2w,
+                }
+            )
+
+    def __len__(self):
+        return len(self.scenes)
+
+    def _scene_key(self, scene_info):
+        return f"{scene_info['source']}/{self._feat_scene_name(scene_info)}"
+
+    def get_stats(self):
+        return f"{len(self)} scenes"
+
+    def _sample_query_frames(self, rng, n, total, offset=0):
+        """Sample n frame indices with minimum gap constraint."""
+        min_gap = self.min_view_interval or 0
+        if min_gap <= 0 or n <= 1:
+            return (
+                torch.linspace(offset, offset + total - 1, n, dtype=torch.float32)
+                .round()
+                .to(torch.long)
+            )
+
+        needed = (n - 1) * min_gap + 1
+        if needed > total:
+            # Fallback: evenly spaced
+            return (
+                torch.linspace(offset, offset + total - 1, n, dtype=torch.float32)
+                .round()
+                .to(torch.long)
+            )
+
+        slack = total - needed
+        cuts = np.sort(rng.integers(0, slack + 1, size=n - 1, dtype=int))
+        extras = np.diff(np.concatenate(([0], cuts, [slack])))
+
+        idxs = [offset]
+        for extra in extras[:-1]:
+            idxs.append(idxs[-1] + min_gap + int(extra))
+        return torch.as_tensor(idxs, dtype=torch.long)
+
+    def _load_infinigen_scene(self, scene_info, sel_indices):
+        """Load frames from an infinigen scene."""
+        frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+        img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+        mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+        cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
+        depth_dir = aoss_fs.join(frames_dir, "Depth", "camera_0")
+
+        # Get sorted list of frame indices from filenames
+        img_files = sorted(
+            [f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")]
+        )
+
+        images = []
+        masks = []
+        depthmaps = []
+        intrinsics = []
+        extrinsics = []
+
+        for idx in sel_indices:
+            idx = idx.item()
+            if idx >= len(img_files):
+                idx = len(img_files) - 1
+
+            img_name = img_files[idx]
+            frame_id = img_name.replace("Image_", "").replace(".png", "")
+
+            # Load image
+            img_path = aoss_fs.join(img_dir, img_name)
+            img = np.array(aoss_fs.load_image(img_path).convert("RGB"))
+            images.append(torch.from_numpy(img).float().permute(2, 0, 1))
+
+            # Load identity mask
+            mask_path = aoss_fs.join(
+                mask_dir, f"ObjectSegmentation_{frame_id}.npy"
+            )
+            if aoss_fs.exists(mask_path):
+                mask = aoss_fs.load_npy(mask_path).astype(np.int64)
+            else:
+                mask = np.zeros(
+                    (images[-1].shape[1], images[-1].shape[2]), dtype=np.int64
+                )
+            masks.append(torch.from_numpy(mask).long())
+
+            # Load depth (float32, meters; 1e10 = invalid/sky)
+            depth_path = aoss_fs.join(depth_dir, f"Depth_{frame_id}.npy")
+            if aoss_fs.exists(depth_path):
+                depth = aoss_fs.load_npy(depth_path).astype(np.float32)
+                depth[depth > 1e6] = 0.0  # mark invalid
+            else:
+                depth = np.zeros(
+                    (images[-1].shape[1], images[-1].shape[2]), dtype=np.float32
+                )
+            depthmaps.append(torch.from_numpy(depth))
+
+            # Load camera parameters
+            cam_path = aoss_fs.join(cam_dir, f"camview_{frame_id}.npz")
+            cam = aoss_fs.load_npy(cam_path)
+            K = torch.from_numpy(cam["K"].astype(np.float32))
+            T = torch.from_numpy(cam["T"].astype(np.float32))
+            intrinsics.append(K)
+            extrinsics.append(camera_to_world_to_extrinsic(T))
+
+        return (
+            torch.stack(images),      # (S, 3, H, W)
+            torch.stack(masks),       # (S, H, W)
+            torch.stack(depthmaps),   # (S, H, W)
+            torch.stack(intrinsics),  # (S, 3, 3)
+            torch.stack(extrinsics),  # (S, 3, 4)
+        )
+
+    def _load_scene_metadata(self, meta_path):
+        """Load immutable scene metadata through a bounded per-worker LRU."""
+        cached = self._scene_metadata_cache.get(meta_path)
+        if cached is not None:
+            self._scene_metadata_cache.move_to_end(meta_path)
+            return cached
+        archive = aoss_fs.load_npy(meta_path)
+        try:
+            # Detach arrays from NpzFile/BytesIO so no file handles remain cached.
+            value = {name: np.asarray(archive[name]) for name in archive.files}
+        finally:
+            close = getattr(archive, "close", None)
+            if close is not None:
+                close()
+        self._scene_metadata_cache[meta_path] = value
+        self._scene_metadata_cache.move_to_end(meta_path)
+        while len(self._scene_metadata_cache) > self._scene_metadata_cache_max:
+            self._scene_metadata_cache.popitem(last=False)
+        return value
+
+    def _label_cache_identity(self, scene_info, task, raw_frame_ids, task_config):
+        """Build a content identity; no path-similarity cache fallback is allowed."""
+        if not self._label_cache_root:
+            return None
+        if not self._label_cache_manifest_sha256:
+            raise RuntimeError(
+                "INSCENE_LABEL_CACHE_ROOT requires INSCENE_MANIFEST_SHA256"
+            )
+        identity = {
+            "label_version": self._label_cache_version,
+            "manifest_sha256": self._label_cache_manifest_sha256,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "source": scene_info["source"],
+            "scene_id": str(scene_info.get("scene_id", self._feat_scene_name(scene_info))),
+            "ordered_raw_frame_ids": [int(v) for v in raw_frame_ids],
+            "prefix": int(len(scene_info.get("streaming_indices", []))),
+            "task": task,
+            "task_config": task_config,
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return identity, os.path.join(
+            self._label_cache_root, self._label_cache_version, task, digest[:2], digest + ".npz"
+        )
+
+    def _load_label_cache(self, cache_identity, expected_fields):
+        if cache_identity is None:
+            return None
+        identity, path = cache_identity
+        if not os.path.isfile(path):
+            return None
+        with np.load(path, allow_pickle=False) as archive:
+            stored = json.loads(str(archive["identity_json"].item()))
+            if stored != identity:
+                raise RuntimeError(f"label cache identity mismatch: {path}")
+            missing = [field for field in expected_fields if field not in archive.files]
+            if missing:
+                raise RuntimeError(f"label cache lacks {missing}: {path}")
+            return {field: torch.from_numpy(archive[field].copy()) for field in expected_fields}
+
+    def _store_label_cache(self, cache_identity, values):
+        if cache_identity is None:
+            return
+        identity, path = cache_identity
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "identity_json": np.asarray(
+                json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            )
+        }
+        payload.update({key: value.detach().cpu().numpy() for key, value in values.items()})
+        fd, tmp = tempfile.mkstemp(prefix=".label-", suffix=".npz", dir=os.path.dirname(path))
+        os.close(fd)
+        try:
+            np.savez(tmp, **payload)
+            os.replace(tmp, path)
+        finally:
+            # On the shared sidecar filesystem, an attribute-cache lookup can
+            # briefly report the pre-rename temporary path as present after
+            # atomic replace.  Cleanup is best-effort; ENOENT means the atomic
+            # commit already consumed the temporary file.
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+    def _load_scannetpp_scene(self, scene_info, sel_indices):
+        """Load frames from a scannetpp scene."""
+        scene_dir = scene_info["scene_dir"]
+        img_dir = aoss_fs.join(scene_dir, "images")
+        mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
+        depth_dir = aoss_fs.join(scene_dir, "depth")
+        meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
+
+        valid_frames = scene_info["valid_frames"]
+        meta = self._load_scene_metadata(meta_path)
+        valid_pose_indices = scene_info.get("valid_pose_indices")
+
+        images = []
+        masks = []
+        depthmaps = []
+        intrinsics = []
+        extrinsics = []
+
+        for idx in sel_indices:
+            idx = idx.item()
+            if idx >= len(valid_frames):
+                idx = len(valid_frames) - 1
+
+            frame_name = valid_frames[idx]
+
+            # Load image
+            img_path = aoss_fs.join(img_dir, frame_name)
+            img = np.array(aoss_fs.load_image(img_path).convert("RGB"))
+            images.append(torch.from_numpy(img).float().permute(2, 0, 1))
+
+            # Load identity mask
+            mask_path = aoss_fs.join(mask_dir, f"{frame_name}.npy")
+            mask = aoss_fs.load_npy(mask_path).astype(np.int64)
+            masks.append(torch.from_numpy(mask).long())
+
+            # Load depth (uint16 PNG in millimeters -> convert to meters)
+            depth_stem = os.path.splitext(frame_name)[0]
+            depth_path = aoss_fs.join(depth_dir, f"{depth_stem}.png")
+            if aoss_fs.exists(depth_path):
+                depth = np.array(aoss_fs.load_image(depth_path)).astype(np.float32) / 1000.0
+            else:
+                depth = np.zeros(
+                    (images[-1].shape[1], images[-1].shape[2]), dtype=np.float32
+                )
+            depthmaps.append(torch.from_numpy(depth))
+
+            meta_idx = (
+                int(valid_pose_indices[idx])
+                if valid_pose_indices is not None
+                else [str(f) for f in meta["images"].tolist()].index(frame_name)
+            )
+
+            K = torch.from_numpy(meta["intrinsics"][meta_idx].astype(np.float32))
+            T = torch.from_numpy(meta["trajectories"][meta_idx].astype(np.float32))
+            intrinsics.append(K)
+            extrinsics.append(camera_to_world_to_extrinsic(T))
+
+        return (
+            torch.stack(images),      # (S, 3, H, W)
+            torch.stack(masks),       # (S, H, W)
+            torch.stack(depthmaps),   # (S, H, W)
+            torch.stack(intrinsics),  # (S, 3, 3)
+            torch.stack(extrinsics),  # (S, 3, 4)
+        )
+
+    def _load_identity_masks_scene(self, scene_info, sel_indices):
+        """Load only raw instance masks for the requested frame indices."""
+        masks = []
+        if scene_info["source"] == "infinigen":
+            frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+            img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+            mask_dir = aoss_fs.join(frames_dir, "ObjectSegmentation", "camera_0")
+            img_files = sort_frame_names([f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")])
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(img_files) - 1)
+                img_name = img_files[idx]
+                frame_id = img_name.replace("Image_", "").replace(".png", "")
+                mask_path = aoss_fs.join(mask_dir, f"ObjectSegmentation_{frame_id}.npy")
+                if aoss_fs.exists(mask_path):
+                    mask = aoss_fs.load_npy(mask_path).astype(np.int64)
+                else:
+                    with aoss_fs.load_image(aoss_fs.join(img_dir, img_name)) as img:
+                        w, h = img.size
+                    mask = np.zeros((h, w), dtype=np.int64)
+                masks.append(torch.from_numpy(mask).long())
+        elif scene_info["source"] == "scannetpp":
+            scene_dir = scene_info["scene_dir"]
+            mask_dir = aoss_fs.join(scene_dir, "refined_ins_ids")
+            valid_frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(valid_frames) - 1)
+                frame_name = valid_frames[idx]
+                mask_path = aoss_fs.join(mask_dir, f"{frame_name}.npy")
+                masks.append(torch.from_numpy(aoss_fs.load_npy(mask_path).astype(np.int64)).long())
+        else:
+            raise ValueError(f"Unknown source: {scene_info['source']}")
+        return torch.stack(masks)
+
+    def _load_images_scene(self, scene_info, sel_indices):
+        """Load RGB only; used by pixel probes without touching instance masks."""
+        images = []
+        if scene_info["source"] == "scannetpp":
+            img_dir = aoss_fs.join(scene_info["scene_dir"], "images")
+            frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                frame = frames[min(int(idx.item()), len(frames) - 1)]
+                image = np.array(aoss_fs.load_image(aoss_fs.join(img_dir, frame)).convert("RGB"))
+                images.append(torch.from_numpy(image).float().permute(2, 0, 1))
+        else:
+            # The canonical protocol is ScanNet++ only; Infinigen scenes keep the
+            # full loader as a fallback for older configs.
+            images, _, _, _, _ = self._load_infinigen_scene(scene_info, sel_indices)
+            return images
+        return torch.stack(images)
+
+    def _load_depth_only_scene(self, scene_info, sel_indices):
+        """Load depth without camera metadata for the identity-only mask probe."""
+        depths = []
+        if scene_info["source"] == "scannetpp":
+            depth_dir = aoss_fs.join(scene_info["scene_dir"], "depth")
+            frames = scene_info["valid_frames"]
+            for idx in sel_indices:
+                frame = frames[min(int(idx.item()), len(frames) - 1)]
+                path = aoss_fs.join(depth_dir, f"{os.path.splitext(frame)[0]}.png")
+                if aoss_fs.exists(path):
+                    depth = np.array(aoss_fs.load_image(path)).astype(np.float32) / 1000.0
+                else:
+                    depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
+                depths.append(torch.from_numpy(depth))
+        else:
+            _, _, depth, _, _ = self._load_infinigen_scene(scene_info, sel_indices)
+            return depth
+        return torch.stack(depths)
+
+    def _getitem_streaming_pixel_probe(self, scene_info, sel_global):
+        """Depth/mask path with exactly the raw modalities used by each loss."""
+        task = self._probe_task
+        images = self._load_images_scene(scene_info, sel_global)
+        images = F.interpolate(
+            images, size=(self.target_h, self.target_w), mode="bilinear", align_corners=False
+        ) / 255.0
+
+        if task == "streaming_depth":
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+            depth_metric = depthmaps.clone()
+            extrinsics, _, _ = invert_pose_ref_and_scale(
+                extrinsics,
+                None,
+                depthmaps=depthmaps.unsqueeze(-1),
+                ref_idx=len(sel_global) - 1,
+                scale_by_points=False,
+            )
+            output = {
+                "image": images,
+                "intrinsics": intrinsics,
+                "extrinsics": extrinsics,
+                "cmaps": (depth_metric > 0).float().unsqueeze(1),
+                "dmaps": depth_metric.unsqueeze(1),
+            }
+        elif task == "streaming_mask":
+            masks = self._resize_masks_to_target(
+                self._load_identity_masks_scene(scene_info, sel_global)
+            )
+            depthmaps = self._load_depth_only_scene(scene_info, sel_global)
+            depthmaps = F.interpolate(
+                depthmaps.unsqueeze(1),
+                size=(self.target_h, self.target_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            output = {
+                "image": images,
+                "identity_ids": self._remap_identity_ids(masks),
+                "cmaps": (depthmaps > 0).float().unsqueeze(1),
+                # Retained for the unchanged validation/train visualization cadence.
+                "dmaps": depthmaps.unsqueeze(1),
+            }
+        else:
+            raise RuntimeError(f"unexpected pixel probe task: {task!r}")
+
+        vfm_feat, vfm_idx = self._load_streaming_prefix_feat(scene_info, sel_global)
+        output.update(
+            vfm_feat=vfm_feat,
+            vfm_idx=vfm_idx,
+            vfm_name=self.vfm_name,
+            manifest_sample_id=str(scene_info.get("sample_id", "")),
+            scene_path=scene_info["scene_dir"],
+            rng=int.from_bytes(self._rng.bytes(4), "big"),
+        )
+        return output
+
+    def _load_camera_depth_scene(self, scene_info, sel_indices):
+        """Load only depth, intrinsics, and extrinsics for feature-only probes."""
+        depthmaps = []
+        intrinsics = []
+        extrinsics = []
+
+        if scene_info["source"] == "infinigen":
+            frames_dir = aoss_fs.join(scene_info["scene_dir"], "frames")
+            img_dir = aoss_fs.join(frames_dir, "Image", "camera_0")
+            cam_dir = aoss_fs.join(frames_dir, "camview", "camera_0")
+            depth_dir = aoss_fs.join(frames_dir, "Depth", "camera_0")
+            img_files = sort_frame_names([f for f in aoss_fs.listdir(img_dir) if f.endswith(".png")])
+
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(img_files) - 1)
+                frame_id = img_files[idx].replace("Image_", "").replace(".png", "")
+
+                depth_path = aoss_fs.join(depth_dir, f"Depth_{frame_id}.npy")
+                if aoss_fs.exists(depth_path):
+                    depth = aoss_fs.load_npy(depth_path).astype(np.float32)
+                    depth[depth > 1e6] = 0.0
+                else:
+                    # Rare fallback; use the RGB size without keeping the image.
+                    img_path = aoss_fs.join(img_dir, img_files[idx])
+                    with aoss_fs.load_image(img_path) as img:
+                        w, h = img.size
+                    depth = np.zeros((h, w), dtype=np.float32)
+                depthmaps.append(torch.from_numpy(depth))
+
+                cam_path = aoss_fs.join(cam_dir, f"camview_{frame_id}.npz")
+                cam = aoss_fs.load_npy(cam_path)
+                intrinsics.append(torch.from_numpy(cam["K"].astype(np.float32)))
+                T = torch.from_numpy(cam["T"].astype(np.float32))
+                extrinsics.append(camera_to_world_to_extrinsic(T))
+
+        elif scene_info["source"] == "scannetpp":
+            scene_dir = scene_info["scene_dir"]
+            depth_dir = aoss_fs.join(scene_dir, "depth")
+            meta_path = aoss_fs.join(scene_dir, "scene_iphone_metadata.npz")
+            valid_frames = scene_info["valid_frames"]
+            meta = self._load_scene_metadata(meta_path)
+            valid_pose_indices = scene_info.get("valid_pose_indices")
+
+            for idx in sel_indices:
+                idx = min(int(idx.item()), len(valid_frames) - 1)
+                frame_name = valid_frames[idx]
+                depth_stem = os.path.splitext(frame_name)[0]
+                depth_path = aoss_fs.join(depth_dir, f"{depth_stem}.png")
+                if aoss_fs.exists(depth_path):
+                    depth = np.array(aoss_fs.load_image(depth_path)).astype(np.float32) / 1000.0
+                else:
+                    depth = np.zeros((self.target_h, self.target_w), dtype=np.float32)
+                depthmaps.append(torch.from_numpy(depth))
+
+                meta_idx = (
+                    int(valid_pose_indices[idx])
+                    if valid_pose_indices is not None
+                    else [str(f) for f in meta["images"].tolist()].index(frame_name)
+                )
+                intrinsics.append(torch.from_numpy(meta["intrinsics"][meta_idx].astype(np.float32)))
+                T = torch.from_numpy(meta["trajectories"][meta_idx].astype(np.float32))
+                extrinsics.append(camera_to_world_to_extrinsic(T))
+        else:
+            raise ValueError(f"Unknown source: {scene_info['source']}")
+
+        return (
+            torch.stack(depthmaps),
+            torch.stack(intrinsics),
+            torch.stack(extrinsics),
+        )
+
+    def _resize_depth_to_target(self, depthmaps, intrinsics):
+        """Resize depth maps and rescale intrinsics without loading RGB/masks."""
+        _, orig_h, orig_w = depthmaps.shape
+        scale_h = self.target_h / orig_h
+        scale_w = self.target_w / orig_w
+        depthmaps = F.interpolate(
+            depthmaps.unsqueeze(1),
+            size=(self.target_h, self.target_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+        intrinsics = intrinsics.clone()
+        intrinsics[:, 0, 0] *= scale_w
+        intrinsics[:, 0, 2] *= scale_w
+        intrinsics[:, 1, 1] *= scale_h
+        intrinsics[:, 1, 2] *= scale_h
+        return depthmaps, intrinsics
+
+    def _resize_masks_to_target(self, masks):
+        return F.interpolate(
+            masks.unsqueeze(1).float(),
+            size=(self.target_h, self.target_w),
+            mode="nearest",
+        ).squeeze(1).long()
+
+    def _resize_to_target(self, images, masks, depthmaps, intrinsics):
+        """Resize images, masks, depth to target resolution and rescale intrinsics."""
+        _, _, orig_h, orig_w = images.shape
+        scale_h = self.target_h / orig_h
+        scale_w = self.target_w / orig_w
+
+        # Resize images: (S, 3, H, W) -> (S, 3, target_h, target_w)
+        images = F.interpolate(
+            images, size=(self.target_h, self.target_w), mode="bilinear", align_corners=False
+        )
+        # Resize masks: (S, H, W) -> (S, target_h, target_w) using nearest to preserve IDs
+        masks = (
+            F.interpolate(
+                masks.unsqueeze(1).float(),
+                size=(self.target_h, self.target_w),
+                mode="nearest",
+            )
+            .squeeze(1)
+            .long()
+        )
+        # Resize depth: (S, H, W) -> (S, target_h, target_w) using bilinear
+        depthmaps = F.interpolate(
+            depthmaps.unsqueeze(1),
+            size=(self.target_h, self.target_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+
+        # Rescale intrinsics for new resolution
+        intrinsics = intrinsics.clone()
+        intrinsics[:, 0, 0] *= scale_w  # fx
+        intrinsics[:, 0, 2] *= scale_w  # cx
+        intrinsics[:, 1, 1] *= scale_h  # fy
+        intrinsics[:, 1, 2] *= scale_h  # cy
+
+        return images, masks, depthmaps, intrinsics
+
+    def _resize_masks_to_target(self, masks):
+        """Resize raw instance masks to the dataset target resolution."""
+        return (
+            F.interpolate(
+                masks.unsqueeze(1).float(),
+                size=(self.target_h, self.target_w),
+                mode="nearest",
+            )
+            .squeeze(1)
+            .long()
+        )
+
+    def _remap_identity_ids(self, masks):
+        """Remap identity IDs to contiguous range [0, N) and cap at max_identity_classes."""
+        unique_ids = masks.unique()
+        if len(unique_ids) > self.max_identity_classes:
+            # Keep the most frequent classes
+            flat = masks.reshape(-1)
+            counts = torch.bincount(flat[flat >= 0])
+            top_ids = counts.argsort(descending=True)[: self.max_identity_classes]
+            keep_set = set(top_ids.tolist())
+            # Mark others as -1 (ignore)
+            new_masks = torch.full_like(masks, -1)
+            for new_id, old_id in enumerate(sorted(keep_set)):
+                new_masks[masks == old_id] = new_id
+            return new_masks
+
+        # Simple remap
+        id_map = {}
+        new_masks = torch.full_like(masks, -1)
+        for new_id, old_id in enumerate(unique_ids.tolist()):
+            if old_id < 0:
+                continue
+            id_map[old_id] = new_id
+            new_masks[masks == old_id] = new_id
+        return new_masks
+
+    # --------------- Spatial Diagnostic helpers ---------------
+    def _feat_scene_name(self, scene_info):
+        """Match the directory naming convention used by features/run_inscene15k.py."""
+        scene_dir = scene_info["scene_dir"]
+        if scene_info["source"] == "infinigen":
+            parent = os.path.basename(os.path.dirname(scene_dir))
+            base = os.path.basename(scene_dir)
+            return f"{parent}__{base}" if parent.startswith("scene_") else base
+        return os.path.basename(scene_dir)
+
+    def _feat_filename(self) -> str:
+        """Filename used inside a per-scene feature directory.
+
+        The convention matches features/run_inscene15k.py:
+          - wan / cogvideox: feature{feat_postfix}.sft  (postfix carries _t<t>_layer<n>)
+          - vjepa2:          feature_layer<n>.sft       (postfix carries _layer<n> too;
+                                                         user is expected to set
+                                                         feat_postfix accordingly)
+          - vjepa:           feature.sft
+        ``feat_postfix`` remains supported for old configs.  New layer-sweep
+        configs can pass ``feature_layer`` instead, which keeps the current
+        default filenames but makes layer changes an ordinary Hydra override.
+        """
+        return feature_filename(
+            self.vfm_name,
+            feat_postfix=self.feat_postfix,
+            feature_layer=self.feature_layer,
+            feature_timestep=self.feature_timestep,
+            feature_prefix=self.feature_prefix,
+        )
+
+    def _streaming_prefix_dir_name(self, scene_info) -> str:
+        if "streaming_window_id" in scene_info and "{window" not in self.streaming_prefix_dir_fmt:
+            return aoss_fs.join(
+                f"window_{int(scene_info['streaming_window_id']):04d}",
+                self.streaming_prefix_dir_fmt.format(
+                    tail=int(scene_info["streaming_tail"]),
+                    length=len(scene_info["streaming_indices"]),
+                ),
+            )
+        return self.streaming_prefix_dir_fmt.format(
+            tail=int(scene_info["streaming_tail"]),
+            length=len(scene_info["streaming_indices"]),
+            window=int(scene_info.get("streaming_window_id", 0)),
+        )
+
+
+    def _filter_streaming_samples_to_prefix_index(self):
+        """Keep only streaming samples present in this VFM's prefix_index.npy.
+
+        Feature extraction can emit fewer windows/prefixes than the shared
+        motion-window manifest (different input_length / obs_len). Probe jobs
+        must follow the on-disk index for the active VFM, otherwise DataLoader
+        hits FileNotFound on the first missing window/prefix and aborts.
+        When a READY owner catalog is bound, keep a sample only if that catalog
+        has a unique owner for it. Prefix-index lookup is not an owner source.
+        """
+        before = len(self.scenes)
+        kept = []
+        dropped = 0
+        missing_index = 0
+        catalog_miss = 0
+        for scene in self.scenes:
+            if "streaming_tail" not in scene:
+                kept.append(scene)
+                continue
+            if self.owner_catalog is not None:
+                key = self._streaming_owner_key(scene)
+                if key in self.owner_catalog["owners"]:
+                    kept.append(scene)
+                else:
+                    catalog_miss += 1
+                    dropped += 1
+                continue
+            scene_dir = self._streaming_prefix_scene_dir(scene)
+            if scene_dir is None:
+                kept.append(scene)
+                continue
+            meta_path = aoss_fs.join(scene_dir, "prefix_index.npy")
+            # Ensure cache is populated.
+            self._streaming_prefix_record(scene)
+            records = self._streaming_prefix_meta_cache.get(meta_path) or {}
+            if not records:
+                missing_index += 1
+                feat_path = aoss_fs.join(
+                    scene_dir,
+                    self._streaming_prefix_dir_name(scene),
+                    self._feat_filename(),
+                )
+                if aoss_fs.exists(feat_path):
+                    kept.append(scene)
+                else:
+                    dropped += 1
+                continue
+            window_id = int(scene.get("streaming_window_id", -1))
+            tail = int(scene["streaming_tail"])
+            if (window_id, tail) in records or tail in records:
+                kept.append(scene)
+            else:
+                dropped += 1
+        self.scenes = kept
+        if dropped or missing_index or catalog_miss:
+            logger.info(
+                f"Streaming prefix_index filter ({self.vfm_name}): "
+                f"{before} -> {len(kept)} samples "
+                f"(dropped={dropped}, scenes_without_index={missing_index}, "
+                f"catalog_miss={catalog_miss})"
+            )
+
+
+    def _streaming_owner_key(self, scene_info):
+        prefix = scene_info.get("streaming_prefix_len", scene_info.get("feature_prefix", self.feature_prefix))
+        if prefix is None and "streaming_indices" in scene_info:
+            prefix = len(scene_info["streaming_indices"])
+        return streaming_key(
+            vfm=self.vfm_name,
+            source=scene_info["source"],
+            scene_id=self._feat_scene_name(scene_info),
+            feature_layer=int(self.feature_layer if self.feature_layer is not None else -1),
+            timestep=None if self.feature_timestep is None else int(self.feature_timestep),
+            window_id=int(scene_info.get("streaming_window_id", -1)),
+            prefix=int(prefix if prefix is not None else -1),
+        )
+
+    def _streaming_feature_uri(self, scene_info) -> str:
+        if self.owner_catalog is not None:
+            return resolve_owner(
+                self.owner_catalog,
+                self._streaming_owner_key(scene_info),
+                label="streaming",
+            )
+        scene_dir = self._streaming_prefix_scene_dir(scene_info)
+        if scene_dir is None:
+            return ""
+        return aoss_fs.join(
+            scene_dir,
+            self._streaming_prefix_dir_name(scene_info),
+            self._feat_filename(),
+        )
+
+    def _streaming_prefix_scene_dir(self, scene_info) -> str | None:
+        root = self.streaming_feat_root or self.root_vfm
+        if root is None:
+            return None
+        return aoss_fs.join(
+            root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+        )
+
+    def _streaming_prefix_record(self, scene_info) -> dict | None:
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            row = probe_owner_overlay.resolve_streaming(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                int(scene_info.get("streaming_window_id", 0)),
+                len(scene_info["streaming_indices"]),
+            )
+            return {
+                "window_id": int(row["window_id"]),
+                "tail": int(row["prefix"]) - 1,
+                "indices": json.loads(row["raw_ids_json"]),
+                "input_length": int(row["input_length"]),
+                "valid_length": int(row["valid_length"]),
+                "pad_mode": row["pad_mode"],
+            }
+        scene_dir = self._streaming_prefix_scene_dir(scene_info)
+        if scene_dir is None:
+            return None
+
+        meta_path = aoss_fs.join(scene_dir, "prefix_index.npy")
+        if meta_path not in self._streaming_prefix_meta_cache:
+            records_by_key = {}
+            if aoss_fs.exists(meta_path):
+                try:
+                    records = aoss_fs.load_npy(meta_path, allow_pickle=True).tolist()
+                    if isinstance(records, dict):
+                        records = records.values()
+                    for record in records:
+                        if isinstance(record, dict) and "tail" in record:
+                            window_id = int(record.get("window_id", -1))
+                            records_by_key[(window_id, int(record["tail"]))] = record
+                            if window_id < 0:
+                                records_by_key[int(record["tail"])] = record
+                except Exception as e:
+                    logger.warning(f"Failed to read streaming prefix metadata {meta_path}: {e}")
+            self._streaming_prefix_meta_cache[meta_path] = records_by_key
+
+        records = self._streaming_prefix_meta_cache[meta_path]
+        window_id = int(scene_info.get("streaming_window_id", -1))
+        return records.get((window_id, int(scene_info["streaming_tail"]))) or records.get(
+            int(scene_info["streaming_tail"])
+        )
+
+    def _owner_feature_layer(self) -> int:
+        layer = int(self.feature_layer if self.feature_layer is not None else 0)
+        return {("lingbot", 48): 47, ("minimax_h3", 50): 49}.get(
+            (self.vfm_name, layer), layer
+        )
+
+    def _owner_feature_timestep(self) -> int:
+        if self.feature_timestep is not None:
+            return int(self.feature_timestep)
+        return 250 if self.vfm_name in {"lingbot", "minimax_h3"} else 749
+
+    def _context_segment_dir_name(self, start: int, tail: int) -> str:
+        return self.context_segment_dir_fmt.format(start=int(start), tail=int(tail))
+
+    def _context_segment_scene_dir(self, scene_info) -> str | None:
+        root = self.context_feat_root
+        if root is None:
+            return None
+        return aoss_fs.join(
+            root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+        )
+
+    def _context_segment_records(self, scene_info) -> dict:
+        scene_dir = self._context_segment_scene_dir(scene_info)
+        if scene_dir is None:
+            return {}
+
+        meta_path = aoss_fs.join(scene_dir, "context_index.npy")
+        if meta_path not in self._context_segment_meta_cache:
+            records_by_key = {}
+            if aoss_fs.exists(meta_path):
+                try:
+                    records = aoss_fs.load_npy(meta_path, allow_pickle=True).tolist()
+                    if isinstance(records, dict):
+                        records = records.values()
+                    for record in records:
+                        if isinstance(record, dict) and "start" in record and "tail" in record:
+                            key = (int(record["start"]), int(record["tail"]))
+                            records_by_key[key] = record
+                except Exception as e:
+                    logger.warning(f"Failed to read context segment metadata {meta_path}: {e}")
+            self._context_segment_meta_cache[meta_path] = records_by_key
+
+        return self._context_segment_meta_cache[meta_path]
+
+    def _context_select_indices(self, context_start: int, context_tail: int) -> torch.Tensor:
+        """Return a fixed-length list of frame ids for batching context features."""
+        valid = list(range(int(context_start), int(context_tail) + 1))
+        target_len = max(int(self.context_len), 1)
+        if len(valid) >= target_len:
+            valid = valid[-target_len:]
+        else:
+            valid = valid + [int(context_tail)] * (target_len - len(valid))
+        return torch.as_tensor(valid, dtype=torch.long)
+
+    def _target_feat_dir(self, scene_info) -> str:
+        """Return the directory containing target features for a scene.
+
+        Two on-disk layouts are supported:
+          * Per-prefix layout: targets stored under ``prefix_{tail:06d}/``
+            sub-directories (older streaming_target extraction layout).
+          * Flat layout: a single ``feature.sft`` per scene holding every
+            target frame, selected by ``target_indices.npy``. Here the prefix
+            length is already encoded in ``target_feat_root`` (e.g.
+            ``dino_prefix_8_m0p35_r0p5``), so no per-prefix sub-directory
+            exists.
+
+        We prefer the per-prefix sub-directory when it is present and fall
+        back to the flat per-scene directory otherwise. This keeps both
+        extraction layouts loadable without breaking existing runs.
+        """
+        scene_dir = aoss_fs.join(
+            self.target_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+        )
+        if (
+            getattr(self, "target_layout", "auto") != "flat"
+            and getattr(self, "streaming_prefix", False)
+            and "streaming_tail" in scene_info
+        ):
+            tail = int(scene_info["streaming_tail"])
+            prefixed = aoss_fs.join(scene_dir, f"prefix_{tail:06d}")
+            if getattr(self, "target_layout", "auto") == "per_prefix" or aoss_fs.isdir(prefixed):
+                return prefixed
+        return scene_dir
+
+    def _target_indices(self, scene_info):
+        """Return the exact frame ids represented by a target cache."""
+        if self.target_feat_root is None:
+            return None
+        # Cache key includes streaming tail so different prefixes stay separate.
+        tail = int(scene_info["streaming_tail"]) if (getattr(self, "streaming_prefix", False) and "streaming_tail" in scene_info) else None
+        cache_key = (
+            scene_info["scene_dir"],
+            self.vfm_name,
+            tail,
+            getattr(self, "target_index_root", None),
+        )
+        if cache_key in self._target_index_cache:
+            return self._target_index_cache[cache_key]
+        target_index_root = getattr(self, "target_index_root", None)
+        if target_index_root:
+            path = aoss_fs.join(
+                target_index_root,
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                "target_indices.npy",
+            )
+        else:
+            path = aoss_fs.join(self._target_feat_dir(scene_info), "target_indices.npy")
+        indices = torch.from_numpy(aoss_fs.load_npy(path)).long() if aoss_fs.exists(path) else None
+        self._target_index_cache[cache_key] = indices
+        return indices
+
+    def _shared_streaming_hidden_obj_id(self, scene_info):
+        """Return the scene-level object id shared by all B streaming prefixes."""
+        lengths = tuple(self._streaming_hidden_prefix_lengths())
+        seed_len = int(self.streaming_hidden_seed_prefix_len)
+        window_indices = tuple(
+            int(i) for i in scene_info.get(
+                "streaming_window_indices",
+                list(range(max(max(lengths), seed_len))),
+            )
+        )
+        key = (
+            scene_info["source"],
+            scene_info["scene_dir"],
+            int(scene_info.get("streaming_window_id", 0)),
+            window_indices,
+            lengths,
+            seed_len,
+            self.hidden_obj_min_visible_pixels,
+            self.streaming_hidden_min_history_visible_frames,
+            self.streaming_hidden_min_query_pixels,
+            self.streaming_hidden_min_border_px,
+            self.streaming_hidden_strict_post_history,
+            tuple(self._streaming_preferred_visible_tail_indices()),
+        )
+        if key in self._streaming_hidden_obj_cache:
+            cached = self._streaming_hidden_obj_cache[key]
+            return None if cached is None else int(cached)
+
+        required_len = max(max(lengths), seed_len)
+        label_identity = self._label_cache_identity(
+            scene_info,
+            "shared_hidden_object",
+            window_indices[:required_len],
+            {
+                "candidate_prefix_lengths": list(lengths),
+                "seed_prefix_len": seed_len,
+                "min_visible_pixels": self.hidden_obj_min_visible_pixels,
+                "min_history_visible_frames": self.streaming_hidden_min_history_visible_frames,
+                "min_query_pixels": self.streaming_hidden_min_query_pixels,
+                "min_border_px": self.streaming_hidden_min_border_px,
+                "strict_post_history": self.streaming_hidden_strict_post_history,
+                "preferred_visible_tail_indices": self._streaming_preferred_visible_tail_indices(),
+            },
+        )
+        cached_label = self._load_label_cache(
+            label_identity, ["object_id", "object_valid"]
+        )
+        if cached_label is not None:
+            obj_id = (
+                int(cached_label["object_id"].item())
+                if bool(cached_label["object_valid"].item()) else None
+            )
+            self._streaming_hidden_obj_cache[key] = obj_id
+            return obj_id
+
+        from vidfm3d.utils.spatial_diag import select_common_history_hidden_object_id
+
+        sel = torch.as_tensor(window_indices[:required_len], dtype=torch.long)
+        masks = self._load_identity_masks_scene(scene_info, sel)
+        depthmaps, intrinsics, _extrinsics = self._load_camera_depth_scene(scene_info, sel)
+        masks = self._resize_masks_to_target(masks)
+        depthmaps, _intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+        confmaps = (depthmaps > 0).float()
+        obj_id = select_common_history_hidden_object_id(
+            masks,
+            confmaps=confmaps,
+            history_len=seed_len,
+            hidden_tail_indices=self._streaming_hidden_tail_indices(),
+            preferred_visible_indices=self._streaming_preferred_visible_tail_indices(),
+            min_visible_pixels=self.hidden_obj_min_visible_pixels,
+            min_history_visible_frames=self.streaming_hidden_min_history_visible_frames,
+            min_query_pixels=self.streaming_hidden_min_query_pixels,
+            min_border_px=self.streaming_hidden_min_border_px,
+            strict_post_history=self.streaming_hidden_strict_post_history,
+        )
+        self._store_label_cache(
+            label_identity,
+            {
+                "object_id": torch.tensor(-1 if obj_id is None else int(obj_id), dtype=torch.long),
+                "object_valid": torch.tensor(obj_id is not None, dtype=torch.bool),
+            },
+        )
+        self._streaming_hidden_obj_cache[key] = obj_id
+        return None if obj_id is None else int(obj_id)
+
+    def _load_target_feat(self, scene_info, target_global_idx, num_frames):
+        """Load an isolated feature for one exact frame.
+
+        Expected file layout (streaming_target mode):
+            {target_feat_root}/{vfm}/{source}/{scene}/prefix_{tail:06d}/feature{feat_postfix}.sft
+        Non-streaming layout:
+            {target_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
+
+        Each .sft contains:
+            feat:           (M, H_f, W_f, C)   — features for M target frames
+            target_indices: saved as target_indices.npy alongside
+
+        Returns the feature for the exact target index, or None if missing.
+        """
+        if self.owner_overlay_enabled:
+            return self._load_target_feats(scene_info, [target_global_idx], num_frames)[0]
+        if self.target_feat_root is None:
+            return None
+        path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
+        if not aoss_fs.exists(path):
+            return None
+        try:
+            data = aoss_fs.load_safetensors(path)
+        except Exception as e:
+            logger.warning(f"Failed to read target feat {path}: {e}")
+            return None
+        feat = _feat_cast(data["feat"])                        # (M, H_f, W_f, C)
+        tgt_idx = self._target_indices(scene_info)
+        if tgt_idx is None:
+            return None
+        matches = torch.nonzero(tgt_idx == int(target_global_idx), as_tuple=False).flatten()
+        return feat[int(matches[0].item())] if matches.numel() else None
+
+    def _load_target_feats(self, scene_info, target_global_indices, num_frames):
+        """Load multiple isolated frame features with one safetensors read."""
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            rows = probe_owner_overlay.resolve_targets(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                [int(v) for v in target_global_indices],
+            )
+            by_uri = {}
+            for row in rows:
+                uri = row["source_uri"]
+                if uri not in by_uri:
+                    local = probe_owner_overlay.materialize_verified(row)
+                    by_uri[uri] = _feat_cast(load_file(local)[row["tensor_key"]])
+            return [by_uri[row["source_uri"]][int(row["source_row_index"])] for row in rows]
+        if self.target_feat_root is None:
+            return [None for _ in target_global_indices]
+        path = aoss_fs.join(self._target_feat_dir(scene_info), self._feat_filename())
+        if not aoss_fs.exists(path):
+            return [None for _ in target_global_indices]
+        try:
+            data = aoss_fs.load_safetensors(path)
+        except Exception as e:
+            logger.warning(f"Failed to read target feat {path}: {e}")
+            return [None for _ in target_global_indices]
+
+        feat = _feat_cast(data["feat"])
+        tgt_idx = self._target_indices(scene_info)
+        if tgt_idx is None:
+            return [None for _ in target_global_indices]
+        index_to_row = {int(frame): row for row, frame in enumerate(tgt_idx.tolist())}
+        return [
+            feat[index_to_row[int(target_idx)]]
+            if int(target_idx) in index_to_row else None
+            for target_idx in target_global_indices
+        ]
+
+    def _load_vfm_feat_for_selection(self, scene_info, num_frames, sel_global):
+        """Load normal VFM features and select the requested global frame indices."""
+        dummy_h, dummy_w = default_feature_hw(self.vfm_name)
+        if self.root_vfm is None:
+            return (
+                torch.zeros(self.num_views, dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
+                torch.arange(self.num_views),
+            )
+
+        vfm_feat_path = aoss_fs.join(
+            self.root_vfm,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not aoss_fs.exists(vfm_feat_path):
+            msg = f"VFM feature not found at {vfm_feat_path}"
+            if not self.allow_missing_vfm:
+                raise FileNotFoundError(
+                    msg + "; run feature extraction first or set allow_missing_vfm=True for debugging"
+                )
+            logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+            dummy_channels = default_feature_channels(self.vfm_name)
+            return (
+                torch.zeros(self.num_views, dummy_h, dummy_w, dummy_channels, dtype=torch.float32),
+                torch.arange(self.num_views),
+            )
+
+        vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
+        if self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+
+        T = vfm_feat.shape[0]
+        vfm_idx = (
+            torch.round(sel_global.float() / max(num_frames - 1, 1) * (T - 1))
+            .long()
+            .clamp(0, T - 1)
+        )
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            _seed_n = int(hashlib.md5((scene_info["scene_dir"] + ":n").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
+    def _load_streaming_prefix_feat(self, scene_info, sel_global):
+        """Load the precomputed VFM feature for one online prefix sample."""
+        dummy_h, dummy_w = default_feature_hw(self.vfm_name)
+        overlay_row = None
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            overlay_row = probe_owner_overlay.resolve_streaming(
+                self.vfm_name,
+                scene_info["source"],
+                self._feat_scene_name(scene_info),
+                self._owner_feature_layer(),
+                self._owner_feature_timestep(),
+                int(scene_info.get("streaming_window_id", 0)),
+                len(scene_info["streaming_indices"]),
+            )
+            vfm_feat_path = probe_owner_overlay.materialize_verified(overlay_row)
+            vfm_feat = _feat_cast(load_file(vfm_feat_path)["feat"])
+        else:
+            vfm_feat = None
+            vfm_feat_path = self._streaming_feature_uri(scene_info)
+            if not vfm_feat_path and self.owner_catalog is not None:
+                raise OwnerCatalogError("owner catalog returned an empty streaming URI")
+        if overlay_row is None and not vfm_feat_path:
+            return (
+                torch.zeros(len(sel_global), dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32),
+                torch.arange(len(sel_global)),
+            )
+
+        if overlay_row is None and not aoss_fs.exists(vfm_feat_path):
+            msg = f"Streaming prefix VFM feature not found at {vfm_feat_path}"
+            if self.owner_catalog is not None or not self.allow_missing_vfm:
+                raise FileNotFoundError(
+                    msg + "; owner catalog and unverified/dummy sources are forbidden"
+                    if self.owner_catalog is not None else
+                    msg + "; run feature extraction with --mode streaming_prefix first "
+                    "or set allow_missing_vfm=True for debugging"
+                )
+            logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+            dummy_channels = default_feature_channels(self.vfm_name)
+            return (
+                torch.zeros(len(sel_global), dummy_h, dummy_w, dummy_channels, dtype=torch.float32),
+                torch.arange(len(sel_global)),
+            )
+
+        if overlay_row is None:
+            vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
+        prefix_len = len(sel_global)
+        meta_record = self._streaming_prefix_record(scene_info)
+        input_length = None
+        valid_length = prefix_len
+        pad_mode = None
+        if meta_record is not None:
+            input_length = int(meta_record.get("input_length", 0) or 0)
+            valid_length = int(meta_record.get("valid_length", prefix_len))
+            pad_mode = meta_record.get("pad_mode")
+
+        positions = torch.arange(prefix_len, dtype=torch.float32)
+        if (
+            pad_mode == "repeat_tail"
+            and prefix_len > 0
+            and input_length is not None
+            and input_length > valid_length
+        ):
+            positions[-1] = float(input_length - 1)
+
+        aether_indices = None
+        if self.vfm_name == "aether":
+            if vfm_feat.ndim != 5:
+                raise ValueError(
+                    "Expected Aether streaming prefix feature feat to be 5D "
+                    f"(2,11,H,W,C), got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
+                )
+            if input_length is None:
+                raise ValueError("Aether streaming prefix metadata lacks input_length.")
+            aether_indices = aether_streaming_token_indices(
+                positions,
+                n_chunks=int(vfm_feat.shape[0]),
+                n_feature_frames=int(vfm_feat.shape[1]),
+                input_length=input_length,
+            )
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        elif self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        if vfm_feat.ndim != 4:
+            raise ValueError(
+                f"Expected streaming prefix VFM feature feat to be 4D (T,H,W,C), "
+                f"got {tuple(vfm_feat.shape)} from {vfm_feat_path}."
+            )
+
+        T = vfm_feat.shape[0]
+        if aether_indices is not None:
+            vfm_idx = aether_indices
+        elif input_length is not None and input_length > 1 and T > 1:
+            # Prefix extraction pads short inputs by repeating the current tail
+            # frame. Historical frames use their real positions in the padded
+            # input; the tail can use its final repeated occurrence.
+            vfm_idx = (
+                positions / float(input_length - 1) * float(T - 1)
+            ).round().long().clamp(0, T - 1)
+        elif prefix_len <= 1:
+            vfm_idx = torch.zeros(prefix_len, dtype=torch.long)
+        else:
+            # Backward-compatible fallback for old caches without prefix_index.npy.
+            vfm_idx = (
+                torch.linspace(0, T - 1, prefix_len, dtype=torch.float32)
+                .round()
+                .long()
+                .clamp(0, T - 1)
+            )
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            seed_key = f"{scene_info['scene_dir']}:prefix:{scene_info['streaming_tail']}:n"
+            _seed_n = int(hashlib.md5(seed_key.encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
+    def _load_context_segment_feat(
+        self,
+        scene_info,
+        context_start: int,
+        context_tail: int,
+        select_indices=None,
+    ):
+        """Load features from one causal input segment [start, ..., tail].
+
+        The segment was forwarded as a video clip without any target/future
+        frames. ``select_indices=None`` returns all frames in the segment,
+        approximately aligned to the cached VFM temporal axis.
+        """
+        scene_dir = self._context_segment_scene_dir(scene_info)
+        if scene_dir is None:
+            return None, None
+
+        context_start = int(context_start)
+        context_tail = int(context_tail)
+        segment_dir = aoss_fs.join(
+            scene_dir,
+            self._context_segment_dir_name(context_start, context_tail),
+        )
+        path = aoss_fs.join(segment_dir, self._feat_filename())
+        if not aoss_fs.exists(path):
+            return None, None
+
+        try:
+            vfm_feat = _feat_cast(aoss_fs.load_safetensors(path)["feat"])
+        except Exception as e:
+            logger.warning(f"Failed to read context segment feat {path}: {e}")
+            return None, None
+        if self.vfm_name == "cogvideox":
+            vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+        if vfm_feat.ndim != 4:
+            raise ValueError(
+                f"Expected context segment VFM feature feat to be 4D (T,H,W,C), "
+                f"got {tuple(vfm_feat.shape)} from {path}."
+            )
+
+        record = self._context_segment_records(scene_info).get((context_start, context_tail), {})
+        input_length = int(record.get("input_length", 0) or 0)
+        valid_length = int(record.get("valid_length", context_tail - context_start + 1))
+        pad_mode = record.get("pad_mode")
+
+        if select_indices is None:
+            select_indices = torch.arange(context_start, context_tail + 1, dtype=torch.long)
+        else:
+            select_indices = torch.as_tensor(select_indices, dtype=torch.long)
+        if select_indices.numel() == 0:
+            return torch.zeros(0, *vfm_feat.shape[1:], dtype=vfm_feat.dtype), torch.zeros(0, dtype=torch.long)
+        if int(select_indices.min().item()) < context_start or int(select_indices.max().item()) > context_tail:
+            raise ValueError(
+                f"Context select indices [{int(select_indices.min())}, {int(select_indices.max())}] "
+                f"outside segment [{context_start}, {context_tail}]"
+            )
+
+        T = vfm_feat.shape[0]
+        positions = (select_indices - context_start).float()
+        if (
+            pad_mode == "repeat_tail"
+            and input_length > valid_length
+            and (select_indices == context_tail).any()
+        ):
+            positions = positions.clone()
+            positions[select_indices == context_tail] = float(input_length - 1)
+        denom = float(max(input_length - 1, valid_length - 1, 1))
+        if T > 1:
+            vfm_idx = (positions / denom * float(T - 1)).round().long().clamp(0, T - 1)
+        else:
+            vfm_idx = torch.zeros_like(select_indices)
+        if self.feat_pixalign:
+            vfm_feat = vfm_feat[vfm_idx]
+            vfm_idx = torch.arange(vfm_feat.shape[0], device=vfm_feat.device)
+
+        if self.scramble_feat:
+            g = torch.Generator()
+            seed_key = f"{scene_info['scene_dir']}:context:{context_start}:{context_tail}:n"
+            _seed_n = int(hashlib.md5(seed_key.encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+            g.manual_seed(_seed_n)
+            vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+        if self.pose_only:
+            vfm_feat = torch.zeros_like(vfm_feat)
+
+        return vfm_feat, vfm_idx
+
+    def _load_streaming_target_feats_from_prefix(self, scene_info, target_global_indices):
+        """Load future target features from cached streaming prefixes.
+
+        The target is the tail token of a longer prefix in the same temporal
+        window.  This is kept only as an explicit leakage-prone/debug control;
+        C probes default to isolated target features because the longer prefix
+        forward has seen the target image.
+        """
+        window_indices = scene_info.get("streaming_window_indices")
+        if not window_indices:
+            return [None for _ in target_global_indices]
+        raw_to_pos = {int(raw): pos for pos, raw in enumerate(window_indices)}
+        feats = []
+        for target_idx in target_global_indices:
+            target_idx = int(target_idx)
+            pos = raw_to_pos.get(target_idx)
+            if pos is None:
+                feats.append(None)
+                continue
+            target_scene = dict(scene_info)
+            target_scene["streaming_tail"] = int(pos)
+            target_scene["streaming_tail_raw"] = int(target_idx)
+            target_scene["streaming_indices"] = [int(i) for i in window_indices[: pos + 1]]
+            try:
+                target_prefix, _ = self._load_streaming_prefix_feat(
+                    target_scene,
+                    torch.as_tensor(target_scene["streaming_indices"], dtype=torch.long),
+                )
+            except FileNotFoundError:
+                feats.append(None)
+                continue
+            feats.append(target_prefix[-1])
+        return feats
+
+    def _getitem_overlap_diag(self, scene_info, sel_global):
+        """A2 path: load only features and deterministic geometric supervision."""
+        from vidfm3d.utils.spatial_diag import compute_overlap_ratio
+
+        raw_ids = [int(v) for v in sel_global.tolist()]
+        identity = self._label_cache_identity(
+            scene_info,
+            "view_consistency",
+            raw_ids,
+            {
+                "target_hw": [self.target_h, self.target_w],
+                "scale_by_points": True,
+                "reference_index": len(raw_ids) - 1 if self.streaming_prefix else 0,
+            },
+        )
+        cached = self._load_label_cache(identity, ["overlap_gt"])
+        if cached is None:
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+            pointmaps = torch.stack([
+                depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+                for i in range(depthmaps.shape[0])
+            ])
+            ref_idx = len(raw_ids) - 1 if self.streaming_prefix else 0
+            extrinsics, pointmaps, depthmaps_hw1 = invert_pose_ref_and_scale(
+                extrinsics,
+                pointmaps,
+                depthmaps=depthmaps.unsqueeze(-1),
+                ref_idx=ref_idx,
+                scale_by_points=True,
+            )
+            depthmaps = depthmaps_hw1.squeeze(-1)
+            overlap_gt = compute_overlap_ratio(
+                pointmaps, intrinsics, extrinsics, depthmaps > 0
+            ).cpu()
+            self._store_label_cache(identity, {"overlap_gt": overlap_gt})
+        else:
+            overlap_gt = cached["overlap_gt"]
+
+        if not self.streaming_prefix:
+            raise RuntimeError("optimized A2 path is enabled only for fixed streaming manifests")
+        vfm_feat, _ = self._load_streaming_prefix_feat(scene_info, sel_global)
+        return {
+            "vfm_feat": vfm_feat,
+            "overlap_gt": overlap_gt,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "sample_id": canonical_streaming_sample_id(scene_info, "a2"),
+        }
+
+    def _action_geometry(self, scene_info, sel_global, target_global):
+        """Reference-relative poses (and C3 anchor overlap) for one C-probe sample.
+
+        Optionally stored in the content-addressed label cache.  Every action
+        label and every evaluation pose field is derived from these tensors, so
+        a cache hit and a recomputation give identical values.
+        """
+        from vidfm3d.utils.spatial_diag import compute_overlap_ratio
+
+        K = int(target_global.numel())
+        need_overlap = bool(self.diag_counterfactual) and K > 0
+        fields = ["extrinsics"] + (["counterfactual_overlap"] if need_overlap else [])
+        cache_identity = self._label_cache_identity(
+            scene_info,
+            "c_probe_geometry",
+            [int(v) for v in sel_global.tolist()],
+            {
+                "target_hw": [self.target_h, self.target_w],
+                "scale_by_points": True,
+                "reference_index": 0,
+                "horizons": [int(v) for v in (target_global - sel_global[0]).tolist()],
+                "fields": fields,
+            },
+        )
+        geometry = self._load_label_cache(cache_identity, fields)
+        if geometry is not None:
+            return geometry
+        depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+            scene_info, sel_global
+        )
+        depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+        pointmaps = torch.stack([
+            depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+            for i in range(depthmaps.shape[0])
+        ])
+        extrinsics, pointmaps_scaled, depthmaps_hw1 = invert_pose_ref_and_scale(
+            extrinsics,
+            pointmaps,
+            depthmaps=depthmaps.unsqueeze(-1),
+            ref_idx=0,
+            scale_by_points=True,
+        )
+        depthmaps = depthmaps_hw1.squeeze(-1)
+        geometry = {"extrinsics": extrinsics.cpu()}
+        if need_overlap:
+            overlap_full = compute_overlap_ratio(
+                pointmaps_scaled, intrinsics, extrinsics, depthmaps > 0
+            )
+            geometry["counterfactual_overlap"] = overlap_full[0, 1:].cpu()
+        self._store_label_cache(cache_identity, geometry)
+        return geometry
+
+    def _load_anchor_isolated_feat(self, scene_info, anchor_global_idx, num_frames):
+        """Isolated (target-style) feature of the anchor frame, or None if absent.
+
+        Under the owner overlay a missing anchor owner is reported as absent;
+        every other overlay error (hash or size mismatch) still fails closed.
+        """
+        if self.owner_overlay_enabled:
+            from vidfm3d.utils import probe_owner_overlay
+            try:
+                probe_owner_overlay.resolve_targets(
+                    self.vfm_name,
+                    scene_info["source"],
+                    self._feat_scene_name(scene_info),
+                    self._owner_feature_layer(),
+                    self._owner_feature_timestep(),
+                    [int(anchor_global_idx)],
+                )
+            except probe_owner_overlay.OwnerOverlayError as exc:
+                if str(exc).startswith("no exact target owner"):
+                    return None
+                raise
+        return self._load_target_feats(scene_info, [anchor_global_idx], num_frames)[0]
+
+    def _getitem_feature_action_diag(self, scene_info, num_frames, sel_global):
+        """Fast path for C1/C2/C3 probes that do not consume RGB, masks, or identity IDs."""
+        from vidfm3d.utils.spatial_diag import encode_relative_pose
+
+        target_global = sel_global[1:]
+        K = int(target_global.numel())
+        target_global_list = [int(target_idx.item()) for target_idx in target_global]
+        sample_task = "c1" if getattr(self, "diag_action", False) else "c2"
+        sample_id = canonical_streaming_sample_id(
+            scene_info,
+            sample_task,
+            target_indices=target_global_list,
+        )
+        paired_sample_id = (
+            str(scene_info.get("paired_sample_id"))
+            if scene_info.get("paired_sample_id") is not None
+            else canonical_streaming_sample_id(scene_info, f"{sample_task}_pair")
+        )
+
+        geometry = self._action_geometry(scene_info, sel_global, target_global)
+        extrinsics = geometry["extrinsics"]
+
+        if getattr(self, "streaming_prefix", False):
+            prefix_global = torch.as_tensor(
+                scene_info["streaming_indices"], dtype=torch.long
+            )
+            input_feat, vfm_idx = self._load_streaming_prefix_feat(
+                scene_info, prefix_global
+            )
+            output_vfm_feat = input_feat
+            input_valid = True
+        else:
+            vf, vfm_idx = self._load_vfm_feat_for_selection(
+                scene_info, num_frames, sel_global
+            )
+            output_vfm_feat = vf
+            context_tail = int(sel_global[0].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
+            input_valid = input_feat is not None
+            if not input_valid:
+                input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
+
+        loaded_target_feats = (
+            self._load_streaming_target_feats_from_prefix(scene_info, target_global_list)
+            if getattr(self, "streaming_prefix", False) and self.streaming_target_from_prefix
+            else [None for _ in target_global_list]
+        )
+        if any(target_feat is None for target_feat in loaded_target_feats):
+            fallback_target_feats = self._load_target_feats(
+                scene_info,
+                target_global_list,
+                num_frames,
+            )
+            loaded_target_feats = [
+                target_feat if target_feat is not None else fallback
+                for target_feat, fallback in zip(loaded_target_feats, fallback_target_feats)
+            ]
+        target_feats = []
+        target_valid = []
+        for target_feat in loaded_target_feats:
+            if target_feat is None:
+                target_feats.append(torch.zeros_like(input_feat[0]))
+                target_valid.append(False)
+            else:
+                target_feats.append(target_feat)
+                target_valid.append(True)
+
+        # Same-domain persistence control.  This is intentionally loaded from
+        # target_isolated, never sliced from the contextual prefix forward.
+        anchor_global_idx = int(sel_global[0].item())
+        anchor_isolated_feat = self._load_anchor_isolated_feat(
+            scene_info, anchor_global_idx, num_frames
+        )
+        anchor_isolated_valid = anchor_isolated_feat is not None
+        if anchor_isolated_feat is None:
+            anchor_isolated_feat = torch.zeros_like(input_feat[0])
+
+        if getattr(self, "diag_action", False):
+            if K != 1:
+                raise ValueError("C1 must receive exactly one selected future target per sample")
+            target_feat = target_feats[0] if target_feats else torch.zeros_like(input_feat[0])
+            target_ok = bool(target_valid[0]) if target_valid else False
+            if "c1_target_horizon" in scene_info and not target_ok:
+                raise FileNotFoundError(
+                    "Missing mixed-horizon C1 isolated target: "
+                    f"sample={sample_id}, horizon={scene_info['c1_target_horizon']}"
+                )
+            horizon = int(scene_info.get(
+                "c1_target_horizon", (getattr(self, "action_horizons", None) or [1])[0]
+            ))
+            return {
+                "vfm_feat": output_vfm_feat,
+                "vfm_idx": vfm_idx,
+                "input_feat": input_feat.clone(),
+                "target_feat": target_feat,
+                "action": encode_relative_pose(extrinsics[0], extrinsics[1]).cpu()
+                if K > 0 else torch.zeros(9, dtype=torch.float32),
+                "target_frame_idx": target_global[0].to(torch.long).cpu()
+                if K > 0 else torch.tensor(-1, dtype=torch.long),
+                "anchor_frame_idx": torch.tensor(anchor_global_idx, dtype=torch.long),
+                "action_horizon": torch.tensor(horizon, dtype=torch.long),
+                "raw_frame_offset": (target_global[0] - sel_global[0]).to(torch.long).cpu(),
+                "anchor_isolated_feat": anchor_isolated_feat,
+                "anchor_isolated_valid": torch.tensor(anchor_isolated_valid, dtype=torch.bool),
+                "dyn_valid": torch.tensor(bool(input_valid and target_ok), dtype=torch.bool),
+                "rng": int.from_bytes(self._rng.bytes(4), "big"),
+                "scene_path": scene_info["scene_dir"],
+                "vfm_name": self.vfm_name,
+                "manifest_sample_id": str(scene_info.get("sample_id", "")),
+                "sample_id": sample_id,
+                "paired_sample_id": paired_sample_id,
+                "streaming_window_id": torch.tensor(
+                    int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+                ),
+                "streaming_tail_raw": torch.tensor(
+                    int(scene_info.get("streaming_tail_raw", anchor_global_idx)), dtype=torch.long
+                ),
+            }
+
+        if K > 0:
+            target_feat_seq = torch.stack(target_feats)
+            horizon_valid = (
+                torch.as_tensor(target_valid, dtype=torch.bool)
+                & bool(input_valid)
+            )
+            path_actions = torch.stack([
+                encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
+                for i in range(K)
+            ])
+            counterfactual_actions = torch.stack([
+                encode_relative_pose(extrinsics[0], extrinsics[i + 1]).cpu()
+                for i in range(K)
+            ])
+            horizons = (target_global - sel_global[0]).to(torch.long).cpu()
+        else:
+            target_feat_seq = torch.zeros(0, *input_feat.shape[1:], dtype=input_feat.dtype)
+            horizon_valid = torch.zeros(0, dtype=torch.bool)
+            path_actions = torch.zeros(0, 9, dtype=torch.float32)
+            counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
+            horizons = torch.zeros(0, dtype=torch.long)
+
+        overlap_anchor = geometry.get("counterfactual_overlap")
+        if overlap_anchor is None:
+            overlap_anchor = torch.ones(K, dtype=torch.float32)
+
+        counterfactual_valid = horizon_valid & (
+            overlap_anchor >= float(self.counterfactual_min_overlap)
+        )
+
+        return {
+            "vfm_feat": output_vfm_feat,
+            "vfm_idx": vfm_idx,
+            "input_feat_seq": input_feat.clone(),
+            "target_feat_seq": target_feat_seq,
+            "path_actions": path_actions,
+            "counterfactual_actions": counterfactual_actions,
+            "target_extrinsics": extrinsics[1:].cpu(),
+            "start_extrinsic": extrinsics[0].cpu(),
+            "action_horizons": horizons,
+            "counterfactual_overlap": overlap_anchor,
+            "path_horizon_valid": horizon_valid,
+            "path_valid": torch.tensor(bool(horizon_valid.all().item()), dtype=torch.bool),
+            "counterfactual_valid": counterfactual_valid,
+            "rng": int.from_bytes(self._rng.bytes(4), "big"),
+            "scene_path": scene_info["scene_dir"],
+            "vfm_name": self.vfm_name,
+            "manifest_sample_id": str(scene_info.get("sample_id", "")),
+            "sample_id": sample_id,
+            "paired_sample_id": paired_sample_id,
+            "anchor_frame_idx": torch.tensor(anchor_global_idx, dtype=torch.long),
+            "anchor_isolated_feat": anchor_isolated_feat,
+            "anchor_isolated_valid": torch.tensor(anchor_isolated_valid, dtype=torch.bool),
+            "streaming_window_id": torch.tensor(
+                int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+            ),
+            "streaming_tail_raw": torch.tensor(
+                int(scene_info.get("streaming_tail_raw", anchor_global_idx)), dtype=torch.long
+            ),
+        }
+
+    def _load_shuffled_feat(self, scene_info, num_frames, sel_global):
+        """Load shuffled-context vfm features for A3.
+
+        Expected layout mirrors the standard feature layout:
+            {shuffled_feat_root}/{vfm}/{source}/{scene}/feature{feat_postfix}.sft
+        with feat shape (T, H_f, W_f, C) indexed the same way as the original
+        (i.e. shuffled[i] = feature of frame i extracted under scrambled context).
+        """
+        if self.shuffled_feat_root is None:
+            return None
+        path = aoss_fs.join(
+            self.shuffled_feat_root,
+            self.vfm_name,
+            scene_info["source"],
+            self._feat_scene_name(scene_info),
+            self._feat_filename(),
+        )
+        if not aoss_fs.exists(path):
+            return None
+        try:
+            shuf = _feat_cast(aoss_fs.load_safetensors(path)["feat"])
+        except Exception as e:
+            logger.warning(f"Failed to read shuffled feat {path}: {e}")
+            return None
+        if self.vfm_name == "cogvideox":
+            shuf = shuf.reshape(-1, *shuf.shape[2:])
+        T = shuf.shape[0]
+        vfm_idx = (
+            torch.round(sel_global.float() / max(num_frames - 1, 1) * (T - 1))
+            .long().clamp(0, T - 1)
+        )
+        if self.feat_pixalign:
+            shuf = shuf[vfm_idx]
+        return shuf
+
+    def __getitem__(self, idx):
+        if self.seed is not None:
+            self._rng = np.random.default_rng(seed=self.seed + idx)
+        elif not hasattr(self, "_rng"):
+            seed = torch.initial_seed()
+            self._rng = np.random.default_rng(seed=seed)
+
+        scene_info = self.scenes[idx]
+        num_frames = scene_info["num_frames"]
+
+        if self.streaming_prefix:
+            prefix_global = torch.as_tensor(
+                scene_info["streaming_indices"], dtype=torch.long
+            )
+            future_horizons = self._streaming_future_horizons(default=[])
+            if "c1_target_horizon" in scene_info:
+                future_horizons = [int(scene_info["c1_target_horizon"])]
+            if (
+                future_horizons
+                and (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
+                and not (
+                    self.diag_overlap
+                    or self.diag_hidden_obj
+                    or self.diag_visible_obj
+                    or self.diag_abnormal
+                )
+            ):
+                tail = int(scene_info["streaming_tail"])
+                window_indices = scene_info.get("streaming_window_indices")
+                if window_indices is not None:
+                    target_positions = [tail + int(h) for h in future_horizons]
+                    if any(pos >= len(window_indices) for pos in target_positions):
+                        raise IndexError(
+                            f"Streaming future target outside window: tail={tail}, "
+                            f"horizons={future_horizons}, window_len={len(window_indices)}"
+                        )
+                    raw_indices = [int(window_indices[tail])] + [
+                        int(window_indices[pos]) for pos in target_positions
+                    ]
+                    sel_global = torch.as_tensor(raw_indices, dtype=torch.long)
+                else:
+                    sel_global = torch.as_tensor(
+                        [tail] + [tail + int(h) for h in future_horizons],
+                        dtype=torch.long,
+                    )
+            else:
+                sel_global = prefix_global
+        else:
+            # Window bounds (defaults to full scene)
+            window_start = scene_info.get("window_start", 0)
+            window_end = scene_info.get("window_end", num_frames)
+            window_frames = window_end - window_start
+
+            # Sample frame indices within the window. Multi-action diagnostic probes
+            # use explicit offsets from one action-reference frame so horizons
+            # have a stable interpretation: [t, t+1, t+10, t+30, ...].
+            explicit_action_horizons = (
+                (self.diag_path_integration or self.diag_counterfactual)
+                and len(self.action_horizons) > 0
+                and window_frames > max(self.action_horizons)
+            )
+            if explicit_action_horizons:
+                max_start = min(window_frames, self.context_len) - max(self.action_horizons)
+                max_start = max(max_start, 1)
+                action_ref = int(self._rng.integers(0, max_start))
+                sel = torch.as_tensor(
+                    [action_ref] + [action_ref + h for h in self.action_horizons],
+                    dtype=torch.long,
+                )
+            else:
+                sample_range = min(window_frames, self.context_len)
+                sel = self._sample_query_frames(self._rng, self.num_views, sample_range)
+
+            if self.query_idx_divisor is not None and not explicit_action_horizons:
+                sel = (
+                    torch.floor((sel - 1) / self.query_idx_divisor) * self.query_idx_divisor
+                    + 1
+                )
+                sel = sel.clamp(min=0, max=window_frames - 1).long()
+
+            # Convert to global frame indices for loading
+            sel_global = sel + window_start
+
+            # C1 target-isolated caches may contain a sparse set of frames.
+            # Align only the target before loading geometry. Input features are
+            # loaded from a causal context_segment cache ending at sel_global[-2].
+            if self.diag_action:
+                cached_targets = self._target_indices(scene_info)
+                if cached_targets is not None and cached_targets.numel() > 0:
+                    candidates = cached_targets[
+                        (cached_targets >= window_start)
+                        & (cached_targets < window_end)
+                    ].sort().values
+                    target_candidates = candidates[candidates > sel_global[-2]]
+                    if target_candidates.numel() > 0:
+                        nearest = (target_candidates - sel_global[-1]).abs().argmin()
+                        target = target_candidates[nearest]
+                        sel_global[-1] = target
+
+        if self.streaming_prefix and self._probe_task in {
+            "streaming_depth", "streaming_mask"
+        }:
+            return self._getitem_streaming_pixel_probe(scene_info, sel_global)
+
+        if self.diag_overlap and not (
+            self.diag_hidden_obj
+            or self.diag_visible_obj
+            or self.diag_abnormal
+            or self.diag_action
+            or self.diag_path_integration
+            or self.diag_counterfactual
+        ):
+            return self._getitem_overlap_diag(scene_info, sel_global)
+
+        if (
+            (self.diag_action or self.diag_path_integration or self.diag_counterfactual)
+            and not (
+                self.diag_overlap
+                or self.diag_hidden_obj
+                or self.diag_visible_obj
+                or self.diag_abnormal
+            )
+            and (self.streaming_prefix or not self.diag_action)
+        ):
+            return self._getitem_feature_action_diag(scene_info, num_frames, sel_global)
+
+        lean_b = (self.diag_hidden_obj or self.diag_visible_obj) and not (
+            self.diag_overlap or self.diag_abnormal or self.diag_action
+            or self.diag_path_integration or self.diag_counterfactual
+        )
+        if lean_b:
+            # B consumes masks + geometry + VFM features; RGB was only carried
+            # through IPC/GPU transfer and never read by ProbeExtensionLitModule.
+            images = None
+            masks = self._load_identity_masks_scene(scene_info, sel_global)
+            depthmaps, intrinsics, extrinsics = self._load_camera_depth_scene(
+                scene_info, sel_global
+            )
+            masks = self._resize_masks_to_target(masks)
+            depthmaps, intrinsics = self._resize_depth_to_target(depthmaps, intrinsics)
+        else:
+            # Load data based on source
+            if scene_info["source"] == "infinigen":
+                images, masks, depthmaps, intrinsics, extrinsics = (
+                    self._load_infinigen_scene(scene_info, sel_global)
+                )
+            elif scene_info["source"] == "scannetpp":
+                images, masks, depthmaps, intrinsics, extrinsics = (
+                    self._load_scannetpp_scene(scene_info, sel_global)
+                )
+            else:
+                raise ValueError(f"Unknown source: {scene_info['source']}")
+
+            # Resize to target resolution (also rescales intrinsics)
+            images, masks, depthmaps, intrinsics = self._resize_to_target(
+                images, masks, depthmaps, intrinsics
+            )
+            images = images / 255.0
+
+        # Build confidence maps from depth validity (1 where depth > 0)
+        confmaps = (depthmaps > 0).float()  # (S, H, W)
+
+        # Compute world-coordinate point maps only when needed (v3 can disable this).
+        if self.include_pmaps:
+            S, H, W = depthmaps.shape
+            pointmaps = []
+            for i in range(S):
+                pts = depth_to_pointmap(depthmaps[i], intrinsics[i], extrinsics[i])
+                pointmaps.append(pts)
+            pointmaps = torch.stack(pointmaps)  # (S, H, W, 3)
+        else:
+            pointmaps = None
+
+        # Preserve the metric world frame for strict B2 labels.  The ordinary
+        # probe tensors below are subsequently rebased/scaled for historical
+        # compatibility, but strict centroids must be past-only world geometry.
+        extrinsics_metric = extrinsics.clone()
+        pointmaps_metric = pointmaps
+
+        # Normalize scene. Streaming prefix uses the current tail frame as ego;
+        # standard sampled clips keep the historical first-frame reference.
+        # If point maps are disabled, scale by depth instead of points.
+        depthmaps_metric = depthmaps.clone() if self.streaming_prefix else None
+        ref_idx = len(sel_global) - 1 if self.streaming_prefix else 0
+        extrinsics, pointmaps_scaled, depthmaps_hw1 = invert_pose_ref_and_scale(
+            extrinsics,                        # (S, 3, 4)
+            pointmaps,
+            depthmaps=depthmaps.unsqueeze(-1),  # (S, H, W, 1)
+            ref_idx=ref_idx,
+            scale_by_points=self.include_pmaps,
+        )
+        if self.streaming_prefix:
+            # The online protocol rebases camera pose to the current tail frame
+            # but leaves per-frame depth scalars in their original metric form.
+            depthmaps = depthmaps_metric
+        else:
+            depthmaps = depthmaps_hw1.squeeze(-1)  # (S, H, W)
+
+        # Keep raw ids for streaming B shared-object selection. Remapped ids are
+        # still used by the normal pixel/identity outputs.
+        raw_identity_ids = masks.clone()
+
+        # Remap identity IDs
+        masks = self._remap_identity_ids(masks)
+
+        # Prepare output
+        output = {}
+        output["manifest_sample_id"] = str(scene_info.get("sample_id", ""))
+        if images is not None:
+            output["image"] = images  # (S, 3, H, W)
+            output["identity_ids"] = masks  # (S, H, W) - integer identity IDs
+            output["intrinsics"] = intrinsics  # (S, 3, 3)
+            output["extrinsics"] = extrinsics  # (S, 3, 4)
+            output["cmaps"] = confmaps.unsqueeze(1)  # (S, 1, H, W)
+            output["dmaps"] = depthmaps.unsqueeze(1)  # (S, 1, H, W)
+        if not lean_b and self.include_pmaps and pointmaps_scaled is not None:
+            output["pmaps"] = pointmaps_scaled.permute(0, 3, 1, 2)  # (S, 3, H, W)
+
+        # VFM features
+        if self.streaming_prefix:
+            vfm_feat, vfm_idx = self._load_streaming_prefix_feat(
+                scene_info, sel_global
+            )
+            output["vfm_feat"] = vfm_feat
+            output["vfm_idx"] = vfm_idx
+        elif self.root_vfm is not None:
+            source_name = scene_info["source"]
+            feat_scene_name = self._feat_scene_name(scene_info)
+            vfm_feat_path = aoss_fs.join(
+                self.root_vfm,
+                self.vfm_name,
+                source_name,
+                feat_scene_name,
+                self._feat_filename(),
+            )
+            if aoss_fs.exists(vfm_feat_path):
+                # NOTE: cast to fp32 to match `_load_shuffled_feat` which does
+                # `.float()`. A dtype mismatch (fp16 vs fp32) between the two
+                # branches lets a probe trivially detect the dtype quantization
+                # signature instead of using content (observed in an earlier
+                # noise-control run).
+                vfm_feat = _feat_cast(aoss_fs.load_safetensors(vfm_feat_path)["feat"])
+                if self.vfm_name == "cogvideox":
+                    # CogVideoX: (2, T_clip, H, W, C) → merge clips → (2*T_clip, H, W, C)
+                    vfm_feat = vfm_feat.reshape(-1, *vfm_feat.shape[2:])
+
+                if vfm_feat.ndim != 4:
+                    raise ValueError(
+                        f"Expected VFM feature feat to be 4D (T,H,W,C), got {tuple(vfm_feat.shape)} "
+                        f"from {vfm_feat_path}. For token models, save activations as a token grid."
+                    )
+
+                T = vfm_feat.shape[0]
+                vfm_idx = torch.round(
+                    sel_global.float() / max(num_frames - 1, 1) * (T - 1)
+                ).long().clamp(0, T - 1)
+                if self.feat_pixalign:
+                    vfm_feat = vfm_feat[vfm_idx]
+                    vfm_idx = torch.arange(
+                        vfm_feat.shape[0], device=vfm_feat.device
+                    )
+                if self.scramble_feat:
+                    # Control experiment: replace with unit-normal noise (same shape).
+                    # Seed on scene_dir (not idx) so train/val index overlap does not let
+                    # the probe memorise noise patterns across splits.
+                    g = torch.Generator()
+                    _seed_n = int(hashlib.md5((scene_info["scene_dir"] + ":n").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+                    g.manual_seed(_seed_n)
+                    vfm_feat = torch.randn(vfm_feat.shape, generator=g, dtype=vfm_feat.dtype)
+                if self.pose_only:
+                    # Unconditional ablation: remove all visual feature signal.
+                    vfm_feat = torch.zeros_like(vfm_feat)
+                output["vfm_feat"] = vfm_feat
+                output["vfm_idx"] = vfm_idx
+            else:
+                msg = f"VFM feature not found at {vfm_feat_path}"
+                if not self.allow_missing_vfm:
+                    raise FileNotFoundError(
+                        msg + "; run feature extraction first or set allow_missing_vfm=True for debugging"
+                    )
+                logger.warning(f"{msg}, using dummy because allow_missing_vfm=True.")
+                dummy_channels = default_feature_channels(self.vfm_name)
+                dummy_h, dummy_w = default_feature_hw(self.vfm_name)
+                output["vfm_feat"] = torch.zeros(
+                    self.num_views, dummy_h, dummy_w, dummy_channels, dtype=torch.float32
+                )
+                output["vfm_idx"] = torch.arange(self.num_views)
+        else:
+            # Dummy features for testing
+            dummy_h, dummy_w = default_feature_hw(self.vfm_name)
+            output["vfm_feat"] = torch.zeros(
+                self.num_views, dummy_h, dummy_w, default_feature_channels(self.vfm_name), dtype=torch.float32
+            )
+            output["vfm_idx"] = torch.arange(self.num_views)
+
+        output["rng"] = int.from_bytes(self._rng.bytes(4), "big")
+        output["scene_path"] = scene_info["scene_dir"]
+        output["vfm_name"] = self.vfm_name
+        if self.streaming_prefix:
+            output["streaming_tail"] = torch.tensor(
+                int(scene_info["streaming_tail"]), dtype=torch.long
+            )
+            output["streaming_window_id"] = torch.tensor(
+                int(scene_info.get("streaming_window_id", -1)), dtype=torch.long
+            )
+            output["streaming_tail_raw"] = torch.tensor(
+                int(scene_info.get("streaming_tail_raw", scene_info["streaming_tail"])), dtype=torch.long
+            )
+            output["prefix_indices"] = sel_global.cpu()
+
+        # ------------------------------------------------------------ Spatial Diagnostic Suite
+        # NOTE: All diagnostic outputs use post-normalization extrinsics + pmaps_scaled.
+        # The geometry stays metrically consistent (rigid transform + uniform scale).
+        if (
+            self.diag_overlap
+            or self.diag_hidden_obj
+            or self.diag_visible_obj
+            or self.diag_action
+            or self.diag_path_integration
+            or self.diag_counterfactual
+        ):
+            from vidfm3d.utils.spatial_diag import (
+                compute_overlap_ratio,
+                compute_hidden_object_target,
+                compute_visible_object_target,
+                compute_object_target_for_id,
+                compute_strict_hidden_object_target_for_id,
+                select_strict_zero_hidden_object_id,
+                polar_from_world_centroid,
+                encode_relative_pose,
+            )
+
+        if self.diag_overlap:
+            assert pointmaps_scaled is not None, "diag_overlap requires include_pmaps=True"
+            valid_mask = (depthmaps > 0)                                 # (S, H, W)
+            output["overlap_gt"] = compute_overlap_ratio(
+                pointmaps_scaled, intrinsics, extrinsics, valid_mask
+            )                                                            # (S, S)
+
+        if self.diag_hidden_obj or self.diag_visible_obj:
+            assert pointmaps_scaled is not None, "diag_hidden_obj/diag_visible_obj requires include_pmaps=True"
+            if self.diag_visible_obj:
+                target = compute_visible_object_target(
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                )
+            elif self.strict_zero_hidden_b2:
+                obj_id = scene_info.get("strict_object_id")
+                if obj_id is None:
+                    obj_id = select_strict_zero_hidden_object_id(
+                        identity_ids=raw_identity_ids,
+                        target_frame_idx=-1,
+                        min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    )
+                target = None if obj_id is None else compute_strict_hidden_object_target_for_id(
+                    obj_id=obj_id,
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_metric,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics_metric,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    target_frame_idx=-1,
+                )
+                if target is not None and scene_info.get("strict_polar") is not None:
+                    # The builder creates one model-independent label at the
+                    # fixed target moment and copies it across all prefixes.
+                    target["polar"] = torch.as_tensor(
+                        scene_info["strict_polar"], dtype=torch.float32
+                    )
+                    if scene_info.get("strict_centroid_world") is not None:
+                        target["delta_world"] = torch.as_tensor(
+                            scene_info["strict_centroid_world"], dtype=torch.float32
+                        )
+                        last_visible = int(target["last_visible_frame"].item())
+                        target["no_update_polar"], _ = polar_from_world_centroid(
+                            target["delta_world"], extrinsics_metric[last_visible]
+                        )
+            elif self._use_shared_streaming_hidden_obj():
+                obj_id = self._shared_streaming_hidden_obj_id(scene_info)
+                target = None if obj_id is None else compute_object_target_for_id(
+                    obj_id=obj_id,
+                    identity_ids=raw_identity_ids,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                    require_hidden=True,
+                )
+            else:
+                target = compute_hidden_object_target(
+                    identity_ids=masks,
+                    pmaps_world=pointmaps_scaled,
+                    confmaps=confmaps,
+                    extrinsics=extrinsics,
+                    min_visible_pixels=self.hidden_obj_min_visible_pixels,
+                    last_frame_idx=-1,
+                )
+            S, H, W = masks.shape
+            # ------------------------------------------------------------------ B2 query token
+            # For B2 we emit a 1D appearance signature of the chosen object,
+            # masked-pooled from the prefix frame with the most visible pixels.
+            # Hidden-object targets have the current frame masked out; visible
+            # sanity targets may therefore choose the current prefix tail.
+            # The mask itself and camera pose are not passed to B2. The pooled
+            # backbone feature can still carry spatial/positional information.
+            vfm_feat_cur = output["vfm_feat"]   # (S, H_f, W_f, C) -- post scramble/pose_only
+            C = vfm_feat_cur.shape[-1]
+
+            if target is None:
+                output["hidden_obj_valid"] = torch.zeros((), dtype=torch.bool)
+                output["hidden_obj_polar"] = torch.zeros(3, dtype=torch.float32)
+                output["hidden_obj_mask"] = torch.zeros(S, H, W, dtype=torch.bool)
+                output["hidden_obj_id"] = torch.tensor(-1, dtype=torch.long)
+                output["belief_query_feat"] = torch.zeros(C, dtype=vfm_feat_cur.dtype)
+                output["belief_query_frame"] = torch.tensor(-1, dtype=torch.long)
+                output["target_raw_object_pixels"] = torch.tensor(-1, dtype=torch.long)
+                output["visible_history_frames"] = torch.tensor(0, dtype=torch.long)
+                output["last_visible_frame"] = torch.tensor(-1, dtype=torch.long)
+                output["last_visible_pixel_area"] = torch.tensor(0, dtype=torch.long)
+                output["no_update_polar"] = torch.zeros(3, dtype=torch.float32)
+                output["hidden_duration"] = torch.tensor(0, dtype=torch.long)
+                output["accumulated_camera_translation"] = torch.tensor(0.0)
+                output["accumulated_camera_rotation"] = torch.tensor(0.0)
+                sample_obj_id = int(scene_info.get("strict_object_id", -1))
+            else:
+                output["hidden_obj_valid"] = target["valid"].cpu()
+                output["hidden_obj_polar"] = target["polar"].cpu()
+                per_frame_mask = target["per_frame_mask"].cpu()
+                output["hidden_obj_id"] = target["obj_id"].cpu()
+                sample_obj_id = int(target["obj_id"].item())
+                output["target_raw_object_pixels"] = target.get(
+                    "target_raw_pixels", torch.tensor(-1, dtype=torch.long)
+                ).cpu()
+                visible_history_indices = target.get("visible_history_indices")
+                output["visible_history_frames"] = torch.tensor(
+                    int(visible_history_indices.numel()) if visible_history_indices is not None else 0,
+                    dtype=torch.long,
+                )
+                output["last_visible_frame"] = target.get(
+                    "last_visible_frame", torch.tensor(-1, dtype=torch.long)
+                ).cpu()
+                output["last_visible_pixel_area"] = target.get(
+                    "last_visible_pixel_area", torch.tensor(0, dtype=torch.long)
+                ).cpu()
+                output["no_update_polar"] = target.get(
+                    "no_update_polar", torch.zeros(3, dtype=torch.float32)
+                ).cpu()
+                output["hidden_duration"] = target.get(
+                    "hidden_duration", torch.tensor(0, dtype=torch.long)
+                ).cpu()
+                output["accumulated_camera_translation"] = target.get(
+                    "accumulated_camera_translation", torch.tensor(0.0)
+                ).cpu()
+                output["accumulated_camera_rotation"] = target.get(
+                    "accumulated_camera_rotation", torch.tensor(0.0)
+                ).cpu()
+
+                # B2: build the object query token BEFORE any mask ablation.
+                # Hidden-object targets use the prefix frame with the most
+                # masked pixels; visible sanity targets are deliberately tied
+                # to the current tail frame so the query and label describe
+                # the same current-view object instance.
+                pix_per_frame = per_frame_mask.flatten(1).sum(dim=1)      # (S,)
+                best_frame = S - 1 if self.diag_visible_obj else int(pix_per_frame.argmax().item())
+                H_f, W_f = vfm_feat_cur.shape[1], vfm_feat_cur.shape[2]
+                m_best = per_frame_mask[best_frame].unsqueeze(0).unsqueeze(0).float()
+                m_feat = torch.nn.functional.interpolate(
+                    m_best, size=(H_f, W_f), mode="nearest"
+                ).squeeze(0).squeeze(0) > 0.5                              # (H_f, W_f)
+                denom = m_feat.float().sum().clamp(min=1.0)
+                query_feat = (vfm_feat_cur[best_frame] * m_feat.unsqueeze(-1)).sum(
+                    dim=(0, 1)
+                ) / denom                                                  # (C,)
+                output["belief_query_feat"] = query_feat
+                output["belief_query_frame"] = torch.tensor(best_frame, dtype=torch.long)
+
+                if self.no_obj_mask:
+                    per_frame_mask = torch.ones_like(per_frame_mask)  # B1 ablation only
+                output["hidden_obj_mask"] = per_frame_mask
+            b2_sample_id = canonical_streaming_sample_id(
+                scene_info,
+                "b2_strict" if self.strict_zero_hidden_b2 else "b2_standard",
+                target_indices=[int(sel_global[-1].item())],
+                object_id=sample_obj_id,
+            )
+            output["sample_id"] = b2_sample_id
+            output["paired_sample_id"] = str(
+                scene_info.get("strict_pair_id")
+                or canonical_streaming_sample_id(
+                    scene_info,
+                    "b2_pair",
+                    target_indices=[int(sel_global[-1].item())],
+                    object_id=sample_obj_id,
+                )
+            )
+        if self.diag_action:
+            # C1 input is a causal video segment forward that ends before the
+            # target frame. Target supervision remains an isolated exact-frame
+            # feature.
+            context_tail = int(sel_global[-2].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
+            target_feat = self._load_target_feat(
+                scene_info, sel_global[-1].item(), num_frames
+            )
+            input_valid = input_feat is not None
+            if target_feat is not None and input_valid:
+                output["target_feat"] = target_feat                       # (H_f, W_f, C)
+                output["input_feat"] = input_feat.clone()                  # (T_ctx, H_f, W_f, C)
+                output["action"] = encode_relative_pose(
+                    extrinsics[-2], extrinsics[-1]
+                ).cpu()
+                output["target_frame_idx"] = sel_global[-1].to(torch.long).cpu()
+                output["dyn_valid"] = torch.ones((), dtype=torch.bool)
+            else:
+                # Fall back: emit zero-valued tensors so collation works, mark invalid
+                vf = output["vfm_feat"]
+                output["target_feat"] = torch.zeros_like(vf[0])
+                output["input_feat"] = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
+                output["action"] = torch.zeros(9, dtype=torch.float32)
+                output["target_frame_idx"] = torch.tensor(-1, dtype=torch.long)
+                output["dyn_valid"] = torch.zeros((), dtype=torch.bool)
+
+        if self.diag_path_integration or self.diag_counterfactual:
+            # C2/C3 input is a causal video segment forward that ends at the
+            # action-reference frame. Target horizons remain isolated
+            # exact-frame features.
+            vf = output["vfm_feat"]
+            K = max(vf.shape[0] - 1, 0)
+            context_tail = int(sel_global[0].item())
+            context_start = max(
+                int(scene_info.get("window_start", 0)),
+                context_tail - int(self.context_len) + 1,
+            )
+            input_feat, _ = self._load_context_segment_feat(
+                scene_info,
+                context_start,
+                context_tail,
+                select_indices=self._context_select_indices(context_start, context_tail),
+            )
+            input_valid = input_feat is not None
+            if not input_valid:
+                input_feat = torch.zeros(int(self.context_len), *vf.shape[1:], dtype=vf.dtype)
+            target_feats = []
+            target_valid = []
+            loaded_target_feats = self._load_target_feats(
+                scene_info,
+                [int(target_idx.item()) for target_idx in sel_global[1:]],
+                num_frames,
+            )
+            for target_feat in loaded_target_feats:
+                if target_feat is None:
+                    target_feats.append(torch.zeros_like(vf[0]))
+                    target_valid.append(False)
+                else:
+                    target_feats.append(target_feat)
+                    target_valid.append(True)
+
+            if K > 0:
+                target_feat_seq = torch.stack(target_feats)
+                horizon_valid = (
+                    torch.as_tensor(target_valid, dtype=torch.bool)
+                    & bool(input_valid)
+                )
+                path_actions = torch.stack([
+                    encode_relative_pose(extrinsics[i], extrinsics[i + 1]).cpu()
+                    for i in range(K)
+                ])
+                counterfactual_actions = torch.stack([
+                    encode_relative_pose(extrinsics[0], extrinsics[i + 1]).cpu()
+                    for i in range(K)
+                ])
+                horizons = (sel_global[1:] - sel_global[0]).to(torch.long).cpu()
+            else:
+                target_feat_seq = torch.zeros(0, *vf.shape[1:], dtype=vf.dtype)
+                horizon_valid = torch.zeros(0, dtype=torch.bool)
+                path_actions = torch.zeros(0, 9, dtype=torch.float32)
+                counterfactual_actions = torch.zeros(0, 9, dtype=torch.float32)
+                horizons = torch.zeros(0, dtype=torch.long)
+
+            overlap_anchor = torch.ones(K, dtype=torch.float32)
+            if pointmaps_scaled is not None and K > 0:
+                valid_mask = (depthmaps > 0)
+                overlap_full = compute_overlap_ratio(
+                    pointmaps_scaled, intrinsics, extrinsics, valid_mask
+                )
+                overlap_anchor = overlap_full[0, 1:].cpu()
+
+            counterfactual_valid = horizon_valid & (
+                overlap_anchor >= float(self.counterfactual_min_overlap)
+            )
+
+            output["input_feat_seq"] = input_feat.clone()
+            output["target_feat_seq"] = target_feat_seq
+            output["path_actions"] = path_actions
+            output["counterfactual_actions"] = counterfactual_actions
+            output["target_extrinsics"] = extrinsics[1:].cpu()
+            output["start_extrinsic"] = extrinsics[0].cpu()
+            output["action_horizons"] = horizons
+            output["counterfactual_overlap"] = overlap_anchor
+            output["path_horizon_valid"] = horizon_valid
+            output["path_valid"] = torch.tensor(bool(horizon_valid.all().item()), dtype=torch.bool)
+            output["counterfactual_valid"] = counterfactual_valid
+
+        if self.diag_abnormal:
+            shuf = self._load_shuffled_feat(scene_info, num_frames, sel_global)
+            output["vfm_feat_shuffled"] = (
+                shuf if shuf is not None else torch.zeros_like(output["vfm_feat"])
+            )
+            # Control consistency: if scramble_feat is on, the "normal" branch
+            # (vfm_feat) was replaced by N(0,1) noise above. The shuffled branch
+            # must be scrambled too, otherwise the probe trivially distinguishes
+            # noise-vs-real-features and gets ~100% acc without using time order.
+            if self.scramble_feat and shuf is not None:
+                g = torch.Generator()
+                _seed_s = int(hashlib.md5((scene_info["scene_dir"] + ":s").encode()).hexdigest()[:8], 16) & 0xFFFFFFFF
+                g.manual_seed(_seed_s)
+                output["vfm_feat_shuffled"] = torch.randn(
+                    output["vfm_feat_shuffled"].shape,
+                    generator=g,
+                    dtype=output["vfm_feat_shuffled"].dtype,
+                )
+            output["abnormal_feat_valid"] = torch.tensor(
+                shuf is not None, dtype=torch.bool
+            )
+
+        if lean_b:
+            required = {"vfm_feat", "hidden_obj_valid", "hidden_obj_polar"}
+            if self._probe_task == "ego_belief_v2":
+                required.add("belief_query_feat")
+            elif self._probe_task:
+                required.add("hidden_obj_mask")
+            else:
+                # INSCENE_PROBE_TASK unset: keep the inputs of both B1 and B2.
+                required.update({"hidden_obj_mask", "belief_query_feat"})
+            audit_keys = {
+                "manifest_sample_id", "sample_id", "paired_sample_id",
+                "scene_path", "vfm_name", "rng",
+            }
+            return {
+                key: value for key, value in output.items()
+                if key in required | audit_keys
+            }
+        return output

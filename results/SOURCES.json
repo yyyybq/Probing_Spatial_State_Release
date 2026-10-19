@@ -1,0 +1,116 @@
+{
+  "schema": "probing_spatial_state.results_sources.v1",
+  "generated": "2026-10-19",
+  "note": "Static tables exported once from the internal accepted-evaluation tables by a one-off export script (not shipped). Storage paths were removed; checkpoint and summary identities are kept as sha256 values.",
+  "files": {
+    "results/canonical_v2_val_seed42.csv": {
+      "sha256": "b5855e2eb302a97bed9f56b45fb99b20f2d31dbd59cd37e46972838aee8cd5c5",
+      "rows": 804,
+      "source": {
+        "description": "Internal accepted canonical V2 evaluation table (not shipped; v2 evaluator, revisions r2, r3, r4)",
+        "sha256": "480a9ded79d3018c714daa55777e356b25003d746b7510de4d28b7e7038d62bb",
+        "rows": 804
+      },
+      "dropped_columns": [
+        "reject_reason",
+        "checkpoint_path",
+        "summary_path"
+      ],
+      "derived_columns": [
+        "line",
+        "variant",
+        "timestep",
+        "seed",
+        "eval_split",
+        "split_id",
+        "ckpt_epoch",
+        "ckpt_step",
+        "train_batch_size_inferred",
+        "checkpoint_replaced",
+        "summary_file",
+        "caveats"
+      ]
+    },
+    "results/timestep_val_seed42.csv": {
+      "sha256": "240a18de6a9e5613dd66ded4c40687960c896be83a802a045bec6ca5e5ec8355",
+      "rows": 316,
+      "source": {
+        "description": "Internal accepted timestep evaluation table (not shipped; v2 evaluator, revision t1)",
+        "sha256": "2b92a8dc13e50d3819d9fb6eb284bed011c21cc9e6002d2c330f6ab180583540",
+        "rows": 316
+      },
+      "dropped_columns": [
+        "reject_reason",
+        "checkpoint_path",
+        "summary_path"
+      ],
+      "derived_columns": [
+        "line",
+        "variant",
+        "timestep",
+        "seed",
+        "eval_split",
+        "split_id",
+        "eval_revision",
+        "ckpt_epoch",
+        "ckpt_step",
+        "train_batch_size_inferred",
+        "checkpoint_replaced",
+        "summary_file",
+        "caveats"
+      ]
+    },
+    "results/c3_from_c1_val_seed42.csv": {
+      "sha256": "0755cc384aa60661f15914f3e8cd68a3fc01e17aada2948a2b0dedf24ad23f3e",
+      "rows": 180,
+      "source": {
+        "description": "Internal accepted C3-from-C1 evaluation table (not shipped; v2 evaluator, C3 action-sensitivity protocol)",
+        "sha256": "fa6b076d7e79188d3171d48ec1e3705248c73e39889db7dc6f5cc084b3aad440",
+        "rows": 180
+      },
+      "dropped_columns": [
+        "reject_reason",
+        "checkpoint_path",
+        "summary_path"
+      ],
+      "derived_columns": [
+        "line",
+        "unique_key",
+        "timestep",
+        "seed",
+        "eval_split",
+        "split_id",
+        "eval_revision",
+        "ckpt_epoch",
+        "ckpt_step",
+        "train_batch_size_inferred",
+        "checkpoint_replaced",
+        "summary_file",
+        "caveats",
+        "c1_unique_key"
+      ]
+    }
+  },
+  "caveat_source": {
+    "description": "Internal per-run release table (not shipped); used only for caveats and checkpoint_replaced",
+    "sha256": "7cc5ea0e717a7d4c5fbde2a0b8e70097e78e780a3cad2bb9e8b846c15cdcbd9e",
+    "rows": 1444
+  },
+  "derived_column_rules": {
+    "line": "constant per table: canonical_v2, timestep or c3_from_c1",
+    "variant": "source column in the C3 table; empty in the other tables",
+    "unique_key": "source unique_key; in the C3 table the probe segment action_dynamics is replaced by c3_from_c1 and the source key is kept as c1_unique_key",
+    "timestep": "parsed from unique_key (t749 placeholder for encoders and Qwen, t250 for lingbot and minimax_h3 in the canonical table)",
+    "seed": "parsed from unique_key",
+    "eval_split": "constant 'val'",
+    "split_id": "canonical_v2, or canonical_v2_minimax_owner_subset_r2 for scope canonical_v2_minimax_all_layers_20261011",
+    "eval_revision": "source column for canonical_v2; constant 't1' (timestep) and 'c3' (C3) otherwise",
+    "ckpt_epoch": "parsed from the checkpoint file name epoch=E-step=S.ckpt",
+    "ckpt_step": "parsed from the checkpoint file name epoch=E-step=S.ckpt",
+    "train_batch_size_inferred": "unique B in {1,2,3,4,6,8} with floor(N_train/B)*(ckpt_epoch+1) == ckpt_step; N_train 2445, or 1523 for the MiniMax all-layers owner subset",
+    "checkpoint_replaced": "from the internal per-run release table: true when an fp32 retrain replaced a checkpoint with non-finite weights",
+    "summary_file": "basename of the evaluator summary JSON",
+    "caveats": "from the internal per-run release table (B2_SCORED_x_OF_y renamed HIDDEN_OBJECT_SCORED_x_OF_y), plus C1_TRAINED_AND_EVALUATED_H1_ONLY, C3_SAME_TRAJECTORY_ENDPOINTS_NOT_COUNTERFACTUAL and H1_TRAINED_NOT_PROTOCOL_C3; C3 rows inherit the caveats of their C1 run except REPORT_WITH_NO_ACTION_SHUFFLED_COPY_LAST_CONTROLS and C1_TRAINED_AND_EVALUATED_H1_ONLY, which H1_TRAINED_NOT_PROTOCOL_C3 replaces",
+    "c1_unique_key": "C3 table only: unique_key of the evaluated C1 (action_dynamics) row in canonical_v2_val_seed42.csv or timestep_val_seed42.csv"
+  }
+}

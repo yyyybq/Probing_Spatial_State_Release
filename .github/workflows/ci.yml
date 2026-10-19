@@ -1,0 +1,43 @@
+name: CPU tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      HF_HUB_OFFLINE: "1"
+      WANDB_MODE: disabled
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e . --no-deps
+      - name: Run portable tests
+        run: python -m pytest -q
+      - name: Probe forward/backward smoke test
+        run: python scripts/smoke_test_probes.py
+      - name: Build and audit the canonical manifests
+        run: |
+          python scripts/build_tstep_canonical_manifests.py build --output-dir "$RUNNER_TEMP/canon"
+          python scripts/build_tstep_canonical_manifests.py audit --manifest-dir "$RUNNER_TEMP/canon"
+      - name: Validate public shell entrypoints
+        run: bash -n scripts/run_streaming_probe_sweep.sh
+      - name: Dry-run the streaming probe sweep
+        run: |
+          DRY_RUN=1 VFMS=dino LINE=canonical FEAT_BASE=/tmp/feat INSCENE_DATA_ROOT=/tmp/data \
+            CANONICAL_MANIFEST_DIR="$RUNNER_TEMP/canon" EXTRACT_STREAMING=0 EXTRACT_TARGETS=0 \
+            bash scripts/run_streaming_probe_sweep.sh

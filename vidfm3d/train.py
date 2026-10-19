@@ -1,0 +1,274 @@
+import glob
+import os
+import signal  # noqa: F401
+from typing import Any, Dict, List, Optional, Tuple
+
+import hydra
+import lightning as L
+import rootutils
+import torch
+from lightning import Callback, LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.loggers import Logger
+from omegaconf import DictConfig, ListConfig, OmegaConf
+
+# Monkey-patch ModelCheckpoint to always save last.ckpt regardless of top-k
+# Lightning gates save_last behind _last_global_step_saved == global_step,
+# which means last.ckpt is NOT saved when val/loss doesn't improve (top-k skip).
+# NOTE: inert for the released experiments. They use
+# configs/callbacks/v3_checkpoint.yaml, whose entries have no _target_, so no
+# configured ModelCheckpoint is built. Lightning's default checkpoint callback
+# keeps only the final <output_dir>/VideoProbe3D/<run_id>/checkpoints/
+# epoch=E-step=S.ckpt and never writes last.ckpt.
+from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint as _MC
+
+_orig_on_train_epoch_end = _MC.on_train_epoch_end
+_orig_on_validation_end = _MC.on_validation_end
+
+def _force_save_last(self, trainer, pl_module, orig_method):
+    orig_method(self, trainer, pl_module)
+    if self.save_last and self._last_global_step_saved != trainer.global_step:
+        if not self._should_skip_saving_checkpoint(trainer):
+            monitor_candidates = self._monitor_candidates(trainer)
+            self._save_last_checkpoint(trainer, monitor_candidates)
+
+def _patched_on_train_epoch_end(self, trainer, pl_module):
+    _force_save_last(self, trainer, pl_module, _orig_on_train_epoch_end)
+
+def _patched_on_validation_end(self, trainer, pl_module):
+    _force_save_last(self, trainer, pl_module, _orig_on_validation_end)
+
+_MC.on_train_epoch_end = _patched_on_train_epoch_end
+_MC.on_validation_end = _patched_on_validation_end
+
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+# ------------------------------------------------------------------------------------ #
+# the setup_root above is equivalent to:
+# - adding project root dir to PYTHONPATH
+#       (so you don't need to force user to install project as a package)
+#       (necessary before importing any local modules e.g. `from src import utils`)
+# - setting up PROJECT_ROOT environment variable
+#       (which is used as a base for paths in "configs/paths/default.yaml")
+#       (this way all filepaths are the same no matter where you run the code)
+# - loading environment variables from ".env" in root dir
+#
+# you can remove it if you:
+# 1. either install project as a package or move entry files to project root dir
+# 2. set `root_dir` to "." in "configs/paths/default.yaml"
+#
+# more info: https://github.com/ashleve/rootutils
+# ------------------------------------------------------------------------------------ #
+
+from vidfm3d.utils import (
+    RankedLogger,
+    extras,
+    get_metric_value,
+    instantiate_callbacks,
+    instantiate_loggers,
+    log_hyperparameters,
+    task_wrapper,
+)
+from vidfm3d.utils.provenance import write_run_manifest
+
+log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _requested_world_size(cfg: DictConfig) -> int:
+    devices = cfg.trainer.get("devices", 1)
+    if isinstance(devices, (list, tuple, ListConfig)):
+        devices_per_node = len(devices)
+    elif isinstance(devices, int):
+        devices_per_node = devices
+    elif str(devices).isdigit():
+        devices_per_node = int(devices)
+    else:
+        devices_per_node = int(os.environ.get("SLURM_GPUS_ON_NODE", "1"))
+    configured = devices_per_node * int(cfg.trainer.get("num_nodes", 1))
+    scheduled = int(os.environ.get("SLURM_NTASKS", "1"))
+    return max(configured, scheduled)
+
+
+def _guard_probe_world_size(cfg: DictConfig) -> None:
+    target = str(cfg.model.get("_target_", ""))
+    world_size = _requested_world_size(cfg)
+    if (
+        target.endswith("ProbeExtensionLitModule")
+        and world_size > 8
+        and not cfg.get("allow_large_probe_ddp", False)
+    ):
+        raise ValueError(
+            f"Refusing {world_size}-way DDP for a small diagnostic probe. "
+            "Use a Slurm job array, or set allow_large_probe_ddp=true only "
+            "after retuning global batch size, learning rate and step budget."
+        )
+
+
+def _guard_legacy_non_streaming(cfg: DictConfig) -> None:
+    """Require explicit opt-in for legacy full-clip InsScene experiments."""
+
+    task_name = str(cfg.get("task_name", ""))
+    if task_name not in {"inscene15k", "inscene15k_ext"}:
+        return
+    if os.environ.get("ALLOW_NON_STREAMING") == "1" or cfg.get("allow_non_streaming", False):
+        return
+    raise ValueError(
+        f"Refusing legacy non-streaming task_name={task_name!r}. "
+        "Streaming is the project default; use experiment=inscene15k_streaming/... "
+        "or scripts/run_streaming_probe_sweep.sh. If this is an intentional "
+        "historical/ablation run, set ALLOW_NON_STREAMING=1 or "
+        "allow_non_streaming=true."
+    )
+
+
+def python_eval_resolver(code: str):
+    return eval(code)
+
+
+# Register the resolver with OmegaConf
+# usage: ${python_code:1 + 1} in yaml
+OmegaConf.register_new_resolver("python_eval", python_eval_resolver)
+
+
+@task_wrapper
+def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
+    training.
+
+    This method is wrapped in optional @task_wrapper decorator, that controls the behavior during
+    failure. Useful for multiruns, saving info about the crash, etc.
+
+    :param cfg: A DictConfig configuration composed by Hydra.
+    :return: A tuple with metrics and dict with all instantiated objects.
+    """
+    _guard_probe_world_size(cfg)
+    _guard_legacy_non_streaming(cfg)
+
+    # set seed for random number generators in pytorch, numpy and python.random
+    if cfg.get("seed") is not None:
+        L.seed_everything(cfg.seed, workers=True)
+
+    write_run_manifest(cfg, cfg.paths.output_dir)
+
+    log.info(f"Instantiating datamodule <{cfg.data.data_module._target_}>")
+    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data.data_module)
+
+    log.info(f"Instantiating model <{cfg.model._target_}>")
+    model: LightningModule = hydra.utils.instantiate(cfg.model)
+
+    log.info("Instantiating callbacks...")
+    callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
+
+    log.info("Instantiating loggers...")
+    logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
+
+    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+    trainer: Trainer = hydra.utils.instantiate(
+        cfg.trainer, callbacks=callbacks, logger=logger
+    )
+
+    object_dict = {
+        "cfg": cfg,
+        "datamodule": datamodule,
+        "model": model,
+        "callbacks": callbacks,
+        "logger": logger,
+        "trainer": trainer,
+    }
+
+    if logger:
+        log.info("Logging hyperparameters!")
+        log_hyperparameters(object_dict)
+
+    if cfg.get("train"):
+        log.info("Starting training!")
+        # Our Lightning checkpoints contain Hydra/OmegaConf objects; scope
+        # pickle compatibility to these explicit project checkpoint loads.
+        trainer.fit(
+            model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"),
+            weights_only=False,
+        )
+
+    train_metrics = dict(trainer.callback_metrics)
+
+    if cfg.get("test"):
+        log.info("Starting testing!")
+        test_ckpt = cfg.get("ckpt_path")
+        if cfg.get("train"):
+            checkpoint_callback = trainer.checkpoint_callback
+            test_ckpt = (
+                checkpoint_callback.best_model_path if checkpoint_callback else None
+            ) or None
+            if test_ckpt is None:
+                log.warning("Best checkpoint unavailable; testing current trained weights.")
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=test_ckpt, weights_only=False)
+
+    test_metrics = trainer.callback_metrics
+
+    # merge train and test metrics
+    metric_dict = {**train_metrics, **test_metrics}
+
+    return metric_dict, object_dict
+
+
+@hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
+def main(cfg: DictConfig) -> Optional[float]:
+    """Main entry point for training.
+
+    :param cfg: DictConfig configuration composed by Hydra.
+    :return: Optional[float] with optimized metric value.
+    """
+    # apply extra utilities
+    # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
+    extras(cfg)
+
+    # If no ckpt_path and the autoresume flag is true, see if there's a latest ckpt in the output directory.
+    # With configs/callbacks/v3_checkpoint.yaml no last.ckpt is written, so this never resumes.
+    user_ckpt = cfg.get("ckpt_path", None)
+    if (not user_ckpt or user_ckpt == "null") and cfg.get("autoresume", True):
+        auto_ckpt = os.path.join(cfg.paths.output_dir, "checkpoints", "last.ckpt")
+        if os.path.exists(auto_ckpt):
+            log.info(f"Found and resuming from last checkpoint: {auto_ckpt}")
+            # try to load the checkpoint -- if corrupted, also set ckpt_path to None
+            try:
+                torch.load(auto_ckpt, map_location="cpu", weights_only=False)
+            except Exception as e:
+                log.warning(f"Checkpoint loading failed: {e}")
+                auto_ckpt = None
+
+            if auto_ckpt is not None:
+                cfg.ckpt_path = auto_ckpt
+
+                # If wandb is used for logging, fetch the run ID so it can be resumed
+                if cfg.get("logger") and "wandb" in cfg.logger and cfg.get("train"):
+                    wandb_dir = os.path.join(
+                        cfg.paths.output_dir, "wandb", "latest-run"
+                    )
+                    wandb_files = glob.glob(os.path.join(wandb_dir, "run-*.wandb"))
+                    if len(wandb_files) > 0:
+                        assert len(wandb_files) == 1, "Multiple wandb files found!"
+                        run_id = (
+                            os.path.basename(wandb_files[0]).split("-")[1].split(".")[0]
+                        )
+                        cfg.logger.wandb.id = run_id
+                        log.info(f"Resuming wandb run with ID: {run_id}")
+                    else:
+                        log.warning("No wandb run found to resume.")
+
+        else:
+            log.info("No checkpoint found; starting from scratch.")
+
+    # train the model
+    metric_dict, _ = train(cfg)
+
+    # safely retrieve metric value for hydra-based hyperparameter optimization
+    metric_value = get_metric_value(
+        metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
+    )
+
+    # return optimized metric
+    return metric_value
+
+
+if __name__ == "__main__":
+    main()
+
+# python vidfm3d/train.py experiment=inscene15k_streaming/ego_belief_v2_dino_v1 prefix_len=8 logger.wandb.offline=true

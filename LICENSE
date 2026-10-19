@@ -1,0 +1,26 @@
+Copyright (c) 2025 Zixuan Huang, Xiang Li, Zhaoyang Lv, James M. Rehg
+Copyright (c) 2026 the Probing Spatial State authors (modifications and additions)
+
+This repository is an adaptation of VidFM3D (https://github.com/zxhuang1698/VidFM3D)
+and is distributed under the same license. See README.md for what was changed.
+
+This project is licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You are free to:
+  - Share: copy and redistribute the material in any medium or format
+  - Adapt: remix, transform, and build upon the material
+
+Under the following terms:
+  - Attribution: You must give appropriate credit.
+  - NonCommercial: You may not use the material for commercial purposes.
+
+Full license text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+-------------------------------------------------------------------------------
+
+This project incorporates code from third-party sources that keep their own
+licenses. See THIRD_PARTY.md and the LICENSE/NOTICE files inside the vendored
+directories (features/f3r, features/aether, vidfm3d/dust3r, vidfm3d/vggt).
+THIRD_PARTY.md also lists third-party-derived files outside these directories,
+such as the VGGT-derived probe components in vidfm3d/models/components/.

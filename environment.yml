@@ -1,0 +1,11 @@
+name: probe-spatial
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - -r requirements-lock.txt
+      - -e .
+      - pytest==8.3.5

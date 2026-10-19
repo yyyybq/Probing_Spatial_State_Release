@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2025 Aether Team
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Note: features/aether/aether/ is a copy of the aether/ package from
+https://github.com/InternRobotics/Aether (formerly OpenRobotLab/Aether), taken
+via the VidFM3D copy (https://github.com/zxhuang1698/VidFM3D). It differs from
+upstream in three places:
+  1. aether/pipelines/aetherv1_pipeline_cogvideox.py, line 22: relative import
+     (`from ..utils.preprocess_utils import imcrop_center`).
+  2. aether/pipelines/aetherv1_pipeline_cogvideox.py, line 495: the video is
+     preprocessed with resize_mode="default" instead of "crop".
+  3. aether/utils/postprocess_utils.py: upstream lines 119-122 (wrapping a
+     float `focal` in a NumPy array) are removed.
+aether/utils/visualize_utils.py is not included.

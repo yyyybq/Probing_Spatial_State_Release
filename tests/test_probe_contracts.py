@@ -1,0 +1,394 @@
+import csv
+import gzip
+import json
+import math
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from safetensors.torch import save_file
+
+from vidfm3d.eval_diag import _summarize
+from vidfm3d.models.components.probe_ego_belief import EgoBeliefProbe
+from vidfm3d.models.components.probe_ego_belief_v2 import EgoBeliefProbeV2
+from vidfm3d.data.components.inscene15k_dataset import InsScene15KDataset
+from vidfm3d.train import _guard_probe_world_size
+from vidfm3d.utils.spatial_diag import (
+    compute_visible_object_target,
+    compute_object_target_for_id,
+    select_streaming_hidden_object_id,
+)
+from omegaconf import OmegaConf
+
+
+def test_b1_is_object_conditioned_without_pose():
+    probe = EgoBeliefProbe(in_channels=8, hidden_dim=16, num_layers=1, num_heads=4)
+    feat = torch.randn(2, 4, 3, 5, 8)
+    object_mask = torch.zeros(2, 4, 3, 5, dtype=torch.bool)
+    object_mask[:, :3, 1, 2] = True
+    assert probe(feat, object_mask).shape == (2, 3)
+    assert not any("pose" in name for name, _ in probe.named_parameters())
+
+
+def test_b1_supports_linear_mlp_and_transformer_decoders():
+    feat = torch.randn(2, 4, 3, 5, 8)
+    object_mask = torch.zeros(2, 4, 3, 5, dtype=torch.bool)
+    object_mask[:, :3, 1, 2] = True
+    for decoder_type in ("linear", "mlp", "transformer"):
+        probe = EgoBeliefProbe(
+            in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+            decoder_type=decoder_type, num_frames=4,
+        )
+        assert probe(feat, object_mask).shape == (2, 3)
+        if decoder_type == "linear":
+            assert isinstance(probe.flat_readout, torch.nn.Linear)
+
+
+def test_b1_transformer_accepts_streaming_variable_lengths():
+    probe = EgoBeliefProbe(
+        in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+        decoder_type="transformer", num_frames=4, max_seq_len=64,
+    )
+    for length in (4, 8, 16):
+        feat = torch.randn(2, length, 3, 5, 8)
+        object_mask = torch.zeros(2, length, 3, 5, dtype=torch.bool)
+        object_mask[:, :-1, 1, 2] = True
+        assert probe(feat, object_mask).shape == (2, 3)
+
+
+def test_b1_ignores_frames_where_conditioned_object_is_hidden():
+    probe = EgoBeliefProbe(in_channels=8, hidden_dim=16, num_layers=1, num_heads=4)
+    feat = torch.randn(1, 4, 3, 5, 8)
+    object_mask = torch.zeros(1, 4, 3, 5, dtype=torch.bool)
+    object_mask[:, :3, 1, 2] = True
+    pooled = probe._mask_pool(feat, object_mask)
+    assert torch.equal(pooled[:, -1], torch.zeros_like(pooled[:, -1]))
+
+
+def test_b1_final_global_feature_is_an_input():
+    probe = EgoBeliefProbe(
+        in_channels=2, hidden_dim=8, num_layers=1, num_heads=2,
+        decoder_type="linear", num_frames=4, use_final_global_feature=True,
+    )
+    with torch.no_grad():
+        probe.flat_readout.weight.zero_()
+        probe.flat_readout.bias.zero_()
+        # Linear flat layout is object tokens, final-global token, visibility bits.
+        probe.flat_readout.weight[0, 4 * 2] = 1.0
+
+    feat = torch.zeros(1, 4, 2, 2, 2)
+    object_mask = torch.zeros(1, 4, 2, 2, dtype=torch.bool)
+    object_mask[:, :3, 0, 0] = True
+    out0 = probe(feat, object_mask)
+    feat[:, -1, :, :, 0] = 3.0
+    out1 = probe(feat, object_mask)
+    assert out0[0, 0] == 0
+    assert out1[0, 0] == 3
+
+
+def test_streaming_b_shared_object_is_selected_from_first_prefix():
+    masks = torch.zeros(64, 4, 4, dtype=torch.long)
+    # Object 1 is visible in the seed prefix and hidden at all streaming tails.
+    masks[0, :3, :3] = 1
+    # Object 2 appears only after prefix=4; it must not be selected.
+    masks[4, :, :] = 2
+    # Object 3 is visible early but not hidden at prefix tail 7.
+    masks[1, :, :] = 3
+    masks[7, :, :] = 3
+
+    obj_id = select_streaming_hidden_object_id(
+        masks,
+        seed_visible_indices=[0, 1, 2],
+        hidden_tail_indices=[3, 7, 15, 31, 63],
+        min_visible_pixels=4,
+    )
+    assert obj_id == 1
+
+
+def test_streaming_b_fixed_object_target_uses_current_prefix_only():
+    masks = torch.zeros(8, 2, 2, dtype=torch.long)
+    masks[0, :, :] = 5
+    masks[4, :, :] = 5
+    pmaps = torch.zeros(8, 2, 2, 3)
+    pmaps[..., 2] = 2.0
+    conf = torch.ones(8, 2, 2)
+    extr = torch.eye(4)[:3].repeat(8, 1, 1)
+
+    target = compute_object_target_for_id(
+        obj_id=5,
+        identity_ids=masks,
+        pmaps_world=pmaps,
+        confmaps=conf,
+        extrinsics=extr,
+        min_visible_pixels=4,
+        last_frame_idx=-1,
+        require_hidden=True,
+    )
+    assert target is not None
+    assert target["per_frame_mask"].shape[0] == 8
+    assert target["per_frame_mask"][0].all()
+    assert target["per_frame_mask"][4].all()
+    assert not target["per_frame_mask"][-1].any()
+
+
+def test_visible_object_target_keeps_reference_frame_mask():
+    masks = torch.zeros(4, 3, 3, dtype=torch.long)
+    masks[0, :2, :2] = 5
+    masks[-1, :2, :2] = 5
+    pmaps = torch.zeros(4, 3, 3, 3)
+    pmaps[..., 2] = 2.0
+    conf = torch.ones(4, 3, 3)
+    extr = torch.eye(4)[:3].repeat(4, 1, 1)
+
+    target = compute_visible_object_target(
+        identity_ids=masks,
+        pmaps_world=pmaps,
+        confmaps=conf,
+        extrinsics=extr,
+        min_visible_pixels=4,
+        last_frame_idx=-1,
+    )
+    assert target is not None
+    assert int(target["obj_id"].item()) == 5
+    assert int(target["per_frame_mask"][-1].sum().item()) == 4
+
+
+def test_b2_has_object_query_without_current_role_embedding():
+    probe = EgoBeliefProbeV2(
+        in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+        max_seq_len=4, max_h=4, max_w=6, n_az_bins=4, n_el_bins=2,
+    )
+    out = probe(torch.randn(2, 4, 3, 5, 8), torch.randn(2, 8))
+    assert out["logits"].shape == (2, 4, 2)
+    assert not hasattr(probe, "role_embed")
+
+
+def test_b2_supports_linear_mlp_and_transformer_decoders():
+    feat = torch.randn(2, 4, 3, 5, 8)
+    query = torch.randn(2, 8)
+    for decoder_type in ("linear", "mlp", "transformer"):
+        probe = EgoBeliefProbeV2(
+            in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+            decoder_type=decoder_type, num_frames=4, max_seq_len=4,
+            max_h=4, max_w=6, n_az_bins=4, n_el_bins=2,
+        )
+        out = probe(feat, query)
+        assert out["logits"].shape == (2, 4, 2)
+        assert out["log_dist"].shape == (2,)
+        if decoder_type == "linear":
+            assert isinstance(probe.flat_readout, torch.nn.Linear)
+
+
+def test_b2_transformer_accepts_streaming_variable_lengths():
+    probe = EgoBeliefProbeV2(
+        in_channels=8, hidden_dim=16, num_layers=1, num_heads=4,
+        decoder_type="transformer", num_frames=4, max_seq_len=64,
+        max_h=4, max_w=6, n_az_bins=4, n_el_bins=2,
+    )
+    for length in (4, 8, 16):
+        out = probe(torch.randn(2, length, 3, 5, 8), torch.randn(2, 8))
+        assert out["logits"].shape == (2, 4, 2)
+        assert out["log_dist"].shape == (2,)
+
+
+def test_b1_summary_wraps_azimuth():
+    records = [{
+        "scene_path": "processed_infinigen/scene",
+        "polar_pred": torch.tensor([math.pi - 0.01, 0.0, 0.0]),
+        "polar_gt": torch.tensor([-math.pi + 0.01, 0.0, 0.0]),
+    }]
+    assert _summarize(records, "ego_belief")["mean_az_err_deg"] < 2.0
+
+
+def test_a3_reports_paired_ranking_and_auc():
+    records = [{
+        "scene_path": "processed_scannetpp_v2/scene",
+        "prob_normal": 0.2,
+        "prob_shuffled": 0.8,
+        "valid": True,
+    }]
+    summary = _summarize(records, "abnormal")
+    assert summary["paired_rank_acc"] == 1.0
+    assert summary["roc_auc"] == 1.0
+
+
+def test_c1_target_lookup_requires_exact_frame():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        cache = root / "wan" / "infinigen" / "scene"
+        cache.mkdir(parents=True)
+        save_file({"feat": torch.stack([torch.zeros(2, 2, 3), torch.ones(2, 2, 3)])},
+                  cache / "feature.sft")
+        np.save(cache / "target_indices.npy", np.array([1, 5], dtype=np.int64))
+        ds = InsScene15KDataset.__new__(InsScene15KDataset)
+        ds.target_feat_root = str(root)
+        ds.vfm_name = "wan"
+        ds._target_index_cache = {}
+        ds._feat_scene_name = lambda scene: "scene"
+        ds._feat_filename = lambda: "feature.sft"
+        scene = {"scene_dir": "/data/scene", "source": "infinigen"}
+        assert torch.equal(ds._load_target_feat(scene, 5, 10), torch.ones(2, 2, 3))
+        assert ds._load_target_feat(scene, 4, 10) is None
+
+
+def test_target_indices_can_use_a_separate_local_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        index_dir = root / "wan" / "scannetpp" / "scene"
+        index_dir.mkdir(parents=True)
+        np.save(index_dir / "target_indices.npy", np.array([3, 7], dtype=np.int64))
+
+        ds = InsScene15KDataset.__new__(InsScene15KDataset)
+        ds.target_feat_root = "aoss://bucket/FEAT_TARGET"
+        ds.target_index_root = str(root)
+        ds.vfm_name = "wan"
+        ds.streaming_prefix = True
+        ds._target_index_cache = {}
+        ds._feat_scene_name = lambda scene: "scene"
+        scene = {"scene_dir": "/data/scene", "source": "scannetpp", "streaming_tail": 7}
+
+        assert torch.equal(ds._target_indices(scene), torch.tensor([3, 7]))
+
+
+def test_flat_target_layout_avoids_remote_prefix_probe(monkeypatch):
+    ds = InsScene15KDataset.__new__(InsScene15KDataset)
+    ds.target_feat_root = "aoss://bucket/FEAT_TARGET"
+    ds.target_layout = "flat"
+    ds.vfm_name = "wan"
+    ds.streaming_prefix = True
+    ds._feat_scene_name = lambda scene: "scene"
+    monkeypatch.setattr(
+        "vidfm3d.data.components.inscene15k_dataset.aoss_fs.isdir",
+        lambda _path: (_ for _ in ()).throw(AssertionError("unexpected remote isdir")),
+    )
+    scene = {"scene_dir": "/data/scene", "source": "scannetpp", "streaming_tail": 7}
+    assert ds._target_feat_dir(scene).endswith("/wan/scannetpp/scene")
+
+
+def test_manifest_scene_dir_can_be_remapped_to_local_storage(monkeypatch):
+    ds = InsScene15KDataset.__new__(InsScene15KDataset)
+    monkeypatch.setenv("INSCENE_LOCAL_SCENE_ROOT", "/local/scannetpp")
+    scene = ds._normalize_scene_manifest_record(
+        {
+            "scene_dir": "s3://bucket/data/processed_scannetpp_v2/scene",
+            "scene_id": "scene",
+            "source": "scannetpp",
+        }
+    )
+    assert scene["scene_dir"] == "/local/scannetpp/scene"
+
+
+def test_expanded_manifest_uses_explicit_streaming_exclusions(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        manifest = root / "samples.jsonl"
+        records = [
+            {
+                "scene_dir": "/data/drop",
+                "scene_id": "drop",
+                "source": "scannetpp",
+                "split": "train",
+                "streaming_window_id": 3,
+                "streaming_tail": 7,
+            },
+            {
+                "scene_dir": "/data/keep",
+                "scene_id": "keep",
+                "source": "scannetpp",
+                "split": "train",
+                "streaming_window_id": 0,
+                "streaming_tail": 7,
+            },
+        ]
+        manifest.write_text("".join(f"{json.dumps(row)}\n" for row in records))
+        exclusions = root / "exclude.txt"
+        exclusions.write_text("drop/window_0003/prefix_000007\n")
+        monkeypatch.setenv("INSCENE_STREAMING_EXCLUSIONS", str(exclusions))
+
+        ds = InsScene15KDataset(
+            root=tmp,
+            sources=[],
+            split="train",
+            scene_manifest=str(manifest),
+            streaming_prefix=True,
+        )
+        assert [row["scene_id"] for row in ds.scenes] == ["keep"]
+
+
+def test_c2_fast_path_uses_context_segment_not_normal_or_isolated_anchor():
+    ds = InsScene15KDataset.__new__(InsScene15KDataset)
+    ds._rng = np.random.default_rng(0)
+    ds.diag_counterfactual = False
+    ds.diag_action = False
+    ds.diag_path_integration = True
+    ds.counterfactual_min_overlap = 0.05
+    ds.vfm_name = "wan"
+    ds.context_len = 4
+    ds.target_h = ds.target_w = 2
+    ds._label_cache_root = None
+    ds.owner_overlay_enabled = False
+    ds._load_camera_depth_scene = lambda scene, sel: (
+        torch.ones(2, 2, 2),
+        torch.eye(3).repeat(2, 1, 1),
+        torch.eye(4)[:3].repeat(2, 1, 1),
+    )
+    ds._resize_depth_to_target = lambda depth, intr: (depth, intr)
+    normal_feat = torch.full((2, 1, 1, 3), -1.0)
+    ds._load_vfm_feat_for_selection = lambda scene, n, sel: (
+        normal_feat.clone(),
+        torch.arange(2),
+    )
+
+    def load_isolated(scene, indices, num_frames):
+        values = {0: 7.0, 1: 9.0}
+        return [torch.full((1, 1, 3), values[int(i)]) for i in indices]
+
+    ds._load_target_feats = load_isolated
+    ds._load_context_segment_feat = lambda scene, start, tail, select_indices=None: (
+        torch.full((1, 1, 1, 3), 11.0),
+        torch.arange(1),
+    )
+    out = ds._getitem_feature_action_diag(
+        {"source": "infinigen", "scene_dir": "/scene"}, 2, torch.tensor([0, 1])
+    )
+    assert torch.equal(out["vfm_feat"][0], normal_feat[0])
+    assert torch.equal(out["input_feat_seq"][0], torch.full((1, 1, 3), 11.0))
+    assert torch.equal(out["target_feat_seq"][0], torch.full((1, 1, 3), 9.0))
+
+
+def test_context_select_indices_are_fixed_length_with_tail_padding():
+    ds = InsScene15KDataset.__new__(InsScene15KDataset)
+    ds.context_len = 5
+    assert torch.equal(
+        ds._context_select_indices(2, 6),
+        torch.tensor([2, 3, 4, 5, 6]),
+    )
+    assert torch.equal(
+        ds._context_select_indices(0, 2),
+        torch.tensor([0, 1, 2, 2, 2]),
+    )
+
+
+def test_inscene_validation_sampling_defaults_to_fixed_seed():
+    with tempfile.TemporaryDirectory() as tmp:
+        val = InsScene15KDataset(root=tmp, sources=[], split="val")
+        train = InsScene15KDataset(root=tmp, sources=[], split="train")
+        explicit_zero = InsScene15KDataset(root=tmp, sources=[], split="train", seed=0)
+        assert val.seed == 0
+        assert train.seed is None
+        assert explicit_zero.seed == 0
+
+
+def test_large_probe_ddp_requires_explicit_override():
+    cfg = OmegaConf.create({
+        "model": {"_target_": "vidfm3d.models.probe_ext_module.ProbeExtensionLitModule"},
+        "trainer": {"devices": 100, "num_nodes": 1},
+        "allow_large_probe_ddp": False,
+    })
+    try:
+        _guard_probe_world_size(cfg)
+    except ValueError as exc:
+        assert "job array" in str(exc)
+    else:
+        raise AssertionError("100-way probe DDP was not rejected")

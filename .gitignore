@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+venv/
+.venv/
+env/
+.env*
+
+# Editors / tools
+.vscode/
+.idea/
+.claude/
+.DS_Store
+
+# Run outputs (Hydra, Lightning, W&B)
+logs/
+outputs/
+multirun/
+lightning_logs/
+wandb/
+*.log
+*.ckpt
+*.pt
+*.pth
+
+# Data, feature caches and generated manifests
+# (data/splits/** is tracked and must not be ignored)
+data_local/
+InsScene-15K/
+FEAT_*/
+manifests_out/
+*.sft
+*.safetensors
+
+# Machine-local results and config (see README and configs/train.yaml)
+results/local/
+configs/local/*
+!configs/local/.gitkeep
