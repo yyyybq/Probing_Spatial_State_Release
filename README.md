@@ -1,14 +1,34 @@
-# Probing Spatial State
+# Probing Spatial State Representations in Visual Foundation Models
 
-Lightweight diagnostic probes trained on **frozen** video and vision foundation-model
-features. They measure how much spatial state those features carry about a camera
-moving through a 3D scene: depth and camera pose, object identity, view overlap,
-the direction of objects that are currently out of view, and the effect of camera
-actions. All probes run on streaming video windows from the ScanNet++ part of
+Baiqiao Yin<sup>1,2</sup>, Zhongang Cai<sup>2</sup>, Ruisi Wang<sup>2</sup>,
+Qiwei Liang<sup>3</sup>, Lei Yang<sup>4</sup>, Ziwei Liu<sup>2</sup>
+
+<sup>1</sup>New York University, <sup>2</sup>Nanyang Technological University,
+<sup>3</sup>The Hong Kong University of Science and Technology,
+<sup>4</sup>The Chinese University of Hong Kong
+
+[Paper (arXiv:2610.40636)](https://arxiv.org/abs/2610.40636) ·
+[Project page](https://yyyybq.github.io/probing-spatial-state/)
+
+![A moving observer builds a spatial representation from partial views of a scene; the four levels L1 to L4](https://yyyybq.github.io/probing-spatial-state/assets/teaser.jpg)
+
+This is the probe code of the paper. The paper asks whether frozen visual foundation
+models provide a spatial state: one that keeps track of what lies beyond the current
+view, is updated under self-motion and can guide action. It probes ten frozen
+representations on streaming egocentric windows of static indoor scenes at four
+levels: **L1** spatial structure, **L2** object persistence, **L3** predictive spatial
+update and **L4** actionability. This repository covers L1 to L3; see
+[Paper and code](#paper-and-code) for what is and is not here.
+
+The probes are lightweight diagnostic heads trained on **frozen** video and vision
+foundation-model features. They measure how much spatial state those features carry
+about a camera moving through a 3D scene: depth and camera pose, object identity, view
+overlap, the direction of objects that are currently out of view, and the effect of
+camera actions. All probes run on streaming video windows from the ScanNet++ part of
 [InsScene-15K](https://huggingface.co/datasets/lifuguan/InsScene-15K).
 
 The code is derived from **VidFM3D**, *How Much 3D Do Video Foundation Models Encode?*
-([arXiv:2512.19949](https://arxiv.org/abs/2512.19949),
+(CVPR 2026; [arXiv:2512.19949](https://arxiv.org/abs/2512.19949),
 [code](https://github.com/zxhuang1698/VidFM3D)) by Zixuan Huang, Xiang Li, Zhaoyang Lv
 and James M. Rehg. Please credit and cite their work (see [Citation](#citation)).
 
@@ -25,6 +45,7 @@ The accepted validation results of all three are in [`results/`](results/README.
 
 ## Contents
 
+- [Paper and code](#paper-and-code)
 - [What is measured](#what-is-measured)
 - [Feature models](#feature-models)
 - [Repository layout](#repository-layout)
@@ -40,6 +61,58 @@ The accepted validation results of all three are in [`results/`](results/README.
 - [Changes relative to VidFM3D](#changes-relative-to-vidfm3d)
 - [License](#license)
 - [Citation](#citation)
+
+## Paper and code
+
+The paper names its tasks by level; the code, configs and result tables use probe keys
+and the IDs A1 to C3:
+
+| Paper level | Paper task | Paper metric | Probe key | ID |
+| --- | --- | --- | --- | --- |
+| L1 Spatial structure | Metric geometry | Depth loss, camera-pose AUC@30 | `streaming_depth` | A1 |
+| L1 Spatial structure | Instance identity | Instance loss | `streaming_mask` | A1 |
+| L1 Spatial structure | View consistency | Balanced accuracy | `view_consistency` | A2 |
+| L2 Object persistence | Object persistence | Angular error (°) | `ego_belief_v2` | B2 |
+| L3 Predictive spatial update | Direct prediction | Global R@1 | `action_dynamics` | C1 |
+| L3 Predictive spatial update | Path integration | Global R@1 | `path_integration` | C2 |
+| L4 Actionability | Goal-conditioned action prediction | Candidate-selection accuracy; progress toward the goal | not in this repository | – |
+
+B1 (`ego_belief`) belongs to the timestep line only and is not reported in the paper.
+
+The three lines of this repository correspond to these parts of the paper:
+
+| Paper section | Line | Result table |
+| --- | --- | --- |
+| Main results table ("Spatial capabilities differ across representations") | Canonical V2 at the designated layers | [`results/canonical_v2_val_seed42.csv`](results/canonical_v2_val_seed42.csv) |
+| "Spatial accessibility depends on layer and streaming prefix" | Canonical V2 at all layers | the same table |
+| Appendix "Generation coordinate analysis" | Timestep sweep | [`results/timestep_val_seed42.csv`](results/timestep_val_seed42.csv) |
+| Appendix "Action sensitivity of direct future prediction" | C3-from-C1 | [`results/c3_from_c1_val_seed42.csv`](results/c3_from_c1_val_seed42.csv) |
+
+A cell of the paper's main table is the mean of the four prefix rows (p = 8, 12, 16,
+24) of a model and probe at the model's designated layer (see
+[Feature models](#feature-models)). Camera-pose AUC@30 is `mean_Auc_30` in the
+`secondary_json` column of the `streaming_depth` rows.
+
+**Not yet in `results/`.** 62 of the 70 cells of the main table can be recomputed in
+this way, and they agree with the paper at its printed precision. The other eight
+were evaluated after this release and will be added in a later update: the CogVideoX
+row (layer 20, all seven columns) and Wan view consistency. The layer sweep in
+`results/` also lacks CogVideoX layer 20, Wan view consistency at every layer, and
+MiniMax-H3 C1 and C2 at layer 10.
+
+**Not in this repository.** The paper also reports analyses whose code and outputs are
+not released here:
+
+- the matched input controls ("What do the probes actually use?") and the history
+  interventions of the appendix;
+- the readout of natively predicted features ("Prediction changes the spatial readout
+  interface") and its supporting controls;
+- goal-conditioned action prediction (L4), in both the candidate-selection and the
+  continuous-output setting;
+- the cross-level comparison ("How the four levels relate");
+- motion composition consistency;
+- the comparison on the 171 shared validation windows;
+- the scene-bootstrap intervals and the figures.
 
 ## What is measured
 
@@ -70,22 +143,25 @@ uses them.
 
 ## Feature models
 
-| Key | Extractor | Weights (downloaded by you) | Layers in the canonical tables |
-| --- | --- | --- | --- |
-| `dino` | `features/dino` | `facebook/dinov2-large` | 0 (last hidden state) |
-| `vjepa2` | `features/vjepa2` | `facebook/vjepa2-vitl-fpc64-256` | 5, 11, 17, 23 |
-| `videomae` | `features/run_inscene15k.py` | `MCG-NJU/videomae-large` | 5, 11, 17, 23 |
-| `f3r` | `features/f3r` (vendored Fast3R) | `jedyang97/Fast3R_ViT_Large_512` | 24 |
-| `qwen2_5_vl` | `features/run_inscene15k_mllm.py` | `Qwen/Qwen2.5-VL-7B-Instruct` | -1 (visual merger output) |
-| `wan` | `features/wan` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | 0, 5, 10, 15, 20, 25, 29 |
-| `cogvideox` | `features/cogvideox` | `THUDM/CogVideoX-5b-I2V` | 0, 5, 10, 30, 35, 40 |
-| `aether` | `features/aether` | `AetherWorldModel/AetherV1` plus CogVideoX-5b-I2V components | 1 |
-| `minimax_h3` | `features/minimax_h3` | `MiniMaxAI/MiniMax-H3`, local path in `MINIMAX_H3_MODEL_PATH` | 10, 20, 30, 40, 50 |
-| `lingbot` | `features/lingbot` | `robbyant/lingbot-video-moe-30b-a3b` in `LINGBOT_MODEL_PATH`, plus a clone of [Robbyant/lingbot-video](https://github.com/Robbyant/lingbot-video) in `LINGBOT_ROOT` | 10, 20, 30, 40, 48 |
+| Key | Paper name | Extractor | Weights (downloaded by you) | Designated layer | Layers in the canonical tables |
+| --- | --- | --- | --- | --- | --- |
+| `dino` | DINOv2-Large | `features/dino` | `facebook/dinov2-large` | 0 | 0 (last hidden state) |
+| `vjepa2` | V-JEPA2 ViT-L | `features/vjepa2` | `facebook/vjepa2-vitl-fpc64-256` | 23 | 5, 11, 17, 23 |
+| `videomae` | VideoMAE-Large | `features/run_inscene15k.py` | `MCG-NJU/videomae-large` | 23 | 5, 11, 17, 23 |
+| `f3r` | Fast3R ViT-L | `features/f3r` (vendored Fast3R) | `jedyang97/Fast3R_ViT_Large_512` | 24 | 24 |
+| `qwen2_5_vl` | Qwen2.5-VL-7B-Instruct | `features/run_inscene15k_mllm.py` | `Qwen/Qwen2.5-VL-7B-Instruct` | -1 | -1 (visual merger output) |
+| `wan` | Wan2.1-T2V-1.3B | `features/wan` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | 20 | 0, 5, 10, 15, 20, 25, 29 |
+| `cogvideox` | CogVideoX-5B-I2V | `features/cogvideox` | `THUDM/CogVideoX-5b-I2V` | 20 | 0, 5, 10, 30, 35, 40 (20 not yet released) |
+| `aether` | AetherV1 | `features/aether` | `AetherWorldModel/AetherV1` plus CogVideoX-5b-I2V components | 1 | 1 |
+| `minimax_h3` | MiniMax-H3 | `features/minimax_h3` | `MiniMaxAI/MiniMax-H3`, local path in `MINIMAX_H3_MODEL_PATH` | 30 | 10, 20, 30, 40, 50 |
+| `lingbot` | LingBot-video MoE-30B-A3B | `features/lingbot` | `robbyant/lingbot-video-moe-30b-a3b` in `LINGBOT_MODEL_PATH`, plus a clone of [Robbyant/lingbot-video](https://github.com/Robbyant/lingbot-video) in `LINGBOT_ROOT` | 30 | 10, 20, 30, 40, 48 |
 
+- **Designated layer.** The layer of the paper's main table. For DINOv2, V-JEPA2,
+  Fast3R, Wan and CogVideoX it follows the choice of VidFM3D.
 - **Timesteps.** Canonical features are taken at scheduler timestep 749 for Wan,
-  CogVideoX and Aether, and at 250 for MiniMax-H3 and LingBot. For the encoders and
-  Qwen2.5-VL the value 749 in configs and result keys is only a placeholder.
+  CogVideoX and Aether, and at 250 for MiniMax-H3 and LingBot. The paper calls these
+  scheduler step 749 and flow coordinate 0.25. For the encoders and Qwen2.5-VL the
+  value 749 in configs and result keys is only a placeholder.
 - **Last-block layer names.** The tables call the last LingBot block L48 and the last
   MiniMax-H3 block L50. On disk, and for `feature_layer`, these are layers 47 and 49.
 - **Licenses.** Each set of weights has its own license, several of them
@@ -386,7 +462,8 @@ column and explained in [results/README.md](results/README.md):
 - the MiniMax-H3 all-layers runs use a 171-window validation subset that is not
   comparable with the 276-window split;
 - B1 and B2 score only windows with a hidden object;
-- Wan has no accepted A2 rows, and Wan timestep 499 has only A1 rows;
+- this release has no Wan A2 rows and no CogVideoX layer-20 rows (see
+  [Paper and code](#paper-and-code)), and Wan timestep 499 has only A1 rows;
 - MiniMax-H3 timestep layers 20 and 25 are missing;
 - timestep values are not comparable across models;
 - timestep rows are not extra points of the canonical rows: most sweep layers have no
@@ -477,14 +554,28 @@ modification notes are in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Citation
 
-If you use this code, please cite VidFM3D, on which it builds:
+If you use this code, the split or the result tables, please cite the paper:
 
 ```bibtex
-@article{huang2025vidfm3d,
-  title   = {How Much 3D Do Video Foundation Models Encode?},
-  author  = {Huang, Zixuan and Li, Xiang and Lv, Zhaoyang and Rehg, James M.},
-  journal = {arXiv preprint arXiv:2512.19949},
-  year    = {2025}
+@misc{yin2026probingspatialstaterepresentations,
+      title={Probing Spatial State Representations in Visual Foundation Models},
+      author={Baiqiao Yin and Zhongang Cai and Ruisi Wang and Qiwei Liang and Lei Yang and Ziwei Liu},
+      year={2026},
+      eprint={2610.40636},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2610.40636},
+}
+```
+
+Please also cite VidFM3D, from which the code is derived:
+
+```bibtex
+@inproceedings{huang2025vidfm3d,
+  title     = {How Much 3D Do Video Foundation Models Encode?},
+  author    = {Huang, Zixuan and Li, Xiang and Lv, Zhaoyang and Rehg, James M.},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2026}
 }
 ```
 
